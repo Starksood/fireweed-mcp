@@ -65,3 +65,29 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # Announce the release to the official MCP registry. Separate job so a registry outage cannot
+  # fail a PyPI publish that already succeeded — PyPI versions are immutable, so a half-failed
+  # release must never force a version bump just to retry the announcement.
+  registry:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write        # OIDC: no PAT stored, the registry trusts the workflow identity
+    steps:
+      - uses: actions/checkout@v4
+      - name: install mcp-publisher
+        run: |
+          curl -sL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_amd64.tar.gz" \
+            | tar xz mcp-publisher
+          chmod +x mcp-publisher
+      # The registry verifies PyPI ownership by finding `mcp-name: <server name>` in the PUBLISHED
+      # README. Assert it here rather than discovering it as a rejection: the README reaches PyPI
+      # only on a version bump, so a missing marker costs a whole release cycle to fix.
+      - name: assert the ownership marker matches server.json
+        run: |
+          NAME=$(python3 -c "import json;print(json.load(open('server.json'))['name'])")
+          grep -q "mcp-name: $NAME" README.md || { echo "README is missing 'mcp-name: $NAME'"; exit 1; }
+          echo "ownership marker present for $NAME"
+      - run: ./mcp-publisher login github-oidc
+      - run: ./mcp-publisher publish

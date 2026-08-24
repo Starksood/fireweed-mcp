@@ -1,5 +1,7 @@
 # fireweed-mcp
 
+<!-- mcp-name: io.github.Starksood/fireweed-mcp -->
+
 Agent memory where every fact carries a receipt.
 
 ```
@@ -96,4 +98,4 @@ it the gate refuses *more* — the safe direction — and `memory_stats` tells y
 **FSL-1.1-ALv2** — source-available. Free for everything except building a competing product;
 converts to **Apache 2.0 on 2028-01-01**. Full text in [`LICENSE.md`](LICENSE.md).
 
-Want to use Fireweed in a commercial product or competing service? → **sanyamsood2@gmail.com**
+Want to use Fireweed in a commercial product or competing service? → **snymsood@icloud.com**

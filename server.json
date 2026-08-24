@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Starksood/fireweed-mcp",
+  "title": "Fireweed",
+  "description": "Agent memory where every fact carries a receipt. A deterministic gate decides what is remembered, recall abstains instead of guessing, and erasure issues a signed certificate.",
+  "version": "0.1.1",
+  "repository": {
+    "url": "https://github.com/Starksood/fireweed-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "fireweed-mcp",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
