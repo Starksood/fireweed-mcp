@@ -1,0 +1,67 @@
+# Publish fireweed-mcp to PyPI via Trusted Publishing (OIDC) — no API token stored anywhere.
+#
+# PyPI publisher configuration this must match EXACTLY:
+#   PyPI Project Name : fireweed-mcp
+#   Owner             : Starksood
+#   Repository name   : fireweed-mcp
+#   Workflow name     : publish.yml
+#   Environment name  : pypi
+#
+# Triggered by publishing a GitHub Release, so a push to main can never ship a version by accident.
+name: publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:        # manual re-run if a publish fails after the release is cut
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]   # 3.9 is the floor the engine actually runs on
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install pytest
+      - run: PYTHONPATH=src python -m pytest -q tests/
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
+      # Fail the release rather than ship a package that installs but cannot import — the exact
+      # failure this project shipped once already and caught only by installing the wheel.
+      - name: smoke-test the built wheel in a clean venv
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/python -c "import fireweed, fireweed_mcp.server as s; assert s.TOOLS; print('import-ok')"
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' \
+            | /tmp/smoke/bin/fireweed-mcp | grep -q '"serverInfo"' && echo "protocol-ok"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi           # must match the Environment name in the PyPI publisher
+    permissions:
+      id-token: write           # required for Trusted Publishing; no token secret needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
