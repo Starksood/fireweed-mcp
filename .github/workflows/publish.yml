@@ -65,6 +65,11 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # A registry rejection after a successful upload must be retryable via workflow_dispatch.
+          # Without this, re-running the workflow dies on "file already exists" and the only way to
+          # retry the ANNOUNCEMENT is to burn an immutable version number.
+          skip-existing: true
 
   # Announce the release to the official MCP registry. Separate job so a registry outage cannot
   # fail a PyPI publish that already succeeded — PyPI versions are immutable, so a half-failed
@@ -89,5 +94,20 @@ jobs:
           NAME=$(python3 -c "import json;print(json.load(open('server.json'))['name'])")
           grep -q "mcp-name: $NAME" README.md || { echo "README is missing 'mcp-name: $NAME'"; exit 1; }
           echo "ownership marker present for $NAME"
+          # The registry enforces limits the schema URL does not advertise. Learned by a 422 on
+          # v0.1.1: description must be <= 100 chars. Check locally so a rejection costs a re-run
+          # rather than a release.
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open("server.json"))
+          bad = []
+          if len(d["description"]) > 100:
+              bad.append(f'description is {len(d["description"])} chars, limit 100')
+          if d["version"] != d["packages"][0]["version"]:
+              bad.append("server.json version != package version")
+          if bad:
+              print("server.json will be rejected:"); [print("  -", b) for b in bad]; sys.exit(1)
+          print("server.json validates locally")
+          PY
       - run: ./mcp-publisher login github-oidc
       - run: ./mcp-publisher publish
