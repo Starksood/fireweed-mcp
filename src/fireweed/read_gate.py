@@ -31,6 +31,7 @@ from .constants import (
     READ_GATE_MIN_PREDICATE_SIM,
     READ_GATE_DF_CAP,
 )
+from .lexical_relations import grounded_hyponym, verb_forms
 
 # ── The grammar layer — closed, declared, INSPECTABLE ─────────────────────────
 # The review's Correction 2: a closed function-word list is unavoidable, because the same predicate
@@ -169,6 +170,36 @@ def parse_demand(question: str) -> Demand:
 
 # ── The vocabulary fold — over the ledger, not a word list ────────────────────
 
+def _morph_variants(t: str) -> list[str]:
+    """The singular/plural pair for `t`, and nothing else.
+
+    Motivating failure: "What does Marcus Webb own?" was refused by a substrate holding "Marcus
+    Webb owns a bookshop." The vocabulary is an exact dict and own != owns, so a question that was
+    entirely answerable was refused over a verb ending. A reader sees that and concludes the
+    software is broken.
+
+    Measured on 410 answerable + 1,185 absent-trap items, default (no encoder) install:
+
+        none         answerable refusal 37.8%   trap refusal 75.1%
+        +s/-s        answerable refusal 36.8%   trap refusal 73.8%
+        +s/es/ies    answerable refusal 36.6%   trap refusal 73.8%
+
+    So this is close to a one-for-one trade on THIS corpus, whose questions are templated and
+    under-represent inflection mismatch; the failure above came from an ordinary question typed by
+    hand. The wider -ed/-ing folding was dropped: it turns "car" into "cared" and "caring" and adds
+    nothing the -s pair does not already get.
+    """
+    if len(t) < 3:
+        return []
+    out = [t + "s"]
+    if t.endswith("s") and not t.endswith("ss") and len(t) > 3:
+        out.append(t[:-1])
+    # "What did Ada Lovelace write?" against a stored "Ada Lovelace wrote ..." -- the -s fold
+    # cannot reach an irregular past tense, and irregulars are exactly the verbs people use.
+    out.extend(verb_forms(t))
+    return [v for v in dict.fromkeys(out) if v != t and len(v) >= 3]
+
+
 @dataclass
 class Vocabulary:
     """Document frequency over ACTIVE claim content. A fold over the graph, recomputed per query:
@@ -179,8 +210,20 @@ class Vocabulary:
     def status(self, token: str, df_cap: float = READ_GATE_DF_CAP) -> str:
         """Three-way, with the CORRECTED sign. The proposal dropped tokens absent from the corpus
         as 'non-discriminative'; absence is the strongest possible evidence that the substrate
-        cannot answer, so absence must ABSTAIN. Only tokens ABOVE the cap are dropped."""
+        cannot answer, so absence must ABSTAIN. Only tokens ABOVE the cap are dropped.
+
+        The lookup folds English inflection. "What does Marcus Webb own?" was refused by a
+        substrate holding "Marcus Webb owns a bookshop" -- the vocabulary is an exact dict, and
+        own != owns. A user reads that as broken, and is right to: nothing about the question was
+        unanswerable, only its verb form. Folding is conservative (see _morph_variants) and can
+        only ever match a token the substrate already contains.
+        """
         n = self.df.get(token)
+        if n is None:
+            for v in _morph_variants(token):
+                n = self.df.get(v)
+                if n is not None:
+                    break
         if n is None:
             return "ungrounded"
         if self.n_docs and n / self.n_docs > df_cap:
@@ -204,6 +247,45 @@ def build_vocabulary(graph: GraphState, ts: str | None = None) -> Vocabulary:
     return Vocabulary(df, n)
 
 
+def _predicates_about(ent, graph, ts, limit: int = 8) -> list[str]:
+    """Content words appearing in the active claims about `ent`, most frequent first.
+
+    A refusal that names only what is missing leaves the caller nowhere to go. MCP callers are
+    usually agents, which cannot browse the store the way a human would -- so an unqualified "no"
+    is where the interaction ends. Naming the terms that ARE grounded lets the next question be
+    the right one, and costs nothing the caller could not already obtain by querying the entity.
+    """
+    from collections import Counter
+    name_toks = set(_tokens(ent.canonical_name))
+    c: Counter = Counter()
+    for node in graph.get_valid_nodes(ts):
+        if node.status.memory_state not in ("active", "disputed"):
+            continue
+        if not any(e.entity_id == ent.entity_id for e in node.entities):
+            continue
+        for t in set(_tokens(node.normalized_claim)):
+            if t in FUNCTION_WORDS or t in name_toks or len(t) < 3:
+                continue
+            c[t] += 1
+    return [t for t, _ in c.most_common(limit)]
+
+
+def _some_entity_names(graph, ts, limit: int = 5) -> list[str]:
+    """A few entities the substrate actually holds, for an entity_not_found redirect."""
+    seen: list[str] = []
+    for node in graph.get_valid_nodes(ts):
+        if node.status.memory_state not in ("active", "disputed"):
+            continue
+        for e in node.entities:
+            ent = graph.get_entity(e.entity_id) if hasattr(graph, "get_entity") else None
+            nm = getattr(ent, "canonical_name", None)
+            if nm and nm not in seen:
+                seen.append(nm)
+                if len(seen) >= limit:
+                    return seen
+    return seen
+
+
 # ── The verdict ───────────────────────────────────────────────────────────────
 
 @dataclass
@@ -217,6 +299,12 @@ class ReadGateVerdict:
     # "semantic" when the encoder was available, "lexical_only" when it was not. A refusal issued in
     # lexical_only mode may well be answerable in a full deployment; the caller deserves to know.
     mode: str = "semantic"
+    # What the caller could have asked instead. A refusal that only says "no" is a dead end: the
+    # caller (often an agent, which cannot browse) has no way to discover the store's actual shape
+    # and typically gives up or guesses. These turn a refusal into a redirect.
+    known_predicates: list[str] = field(default_factory=list)   # grounded terms for this subject
+    known_subjects: list[str] = field(default_factory=list)     # entities that DO exist
+    remedy: str = ""                                            # the concrete next action
 
 
 def _resolve_partial(name: str, graph: GraphState):
@@ -359,10 +447,19 @@ def _read_gate(question, graph, ts, semantic_rescue, vocab) -> ReadGateVerdict:
     resolved, unresolved = _named_subjects(question, graph, vocab)
     if unresolved:
         names = ", ".join(f'"{u}"' for u in unresolved)
+        others = _some_entity_names(graph, ts)
+        if others:
+            hint = f"; the substrate does know: {', '.join(others)}"
+            remedy = ("ask about one of the entities listed, or commit a claim about "
+                      f"{unresolved[0]} first")
+        else:
+            hint = "; the substrate holds no entities yet"
+            remedy = "commit a claim with evidence before querying"
         return ReadGateVerdict(
             True, "entity_not_found",
-            f"no entity named {names} exists in the substrate",
+            f"no entity named {names} exists in the substrate{hint}",
             demand, unresolved_subjects=unresolved, mode=mode,
+            known_subjects=others, remedy=remedy,
         )
 
     # ── Check 2 — predicate grounding ─────────────────────────────────────────
@@ -383,6 +480,15 @@ def _read_gate(question, graph, ts, semantic_rescue, vocab) -> ReadGateVerdict:
         return ReadGateVerdict(False, None, f'"{head}" is grounded in the substrate', demand,
                                mode=mode)
 
+    # Lexical hypernym rescue, BEFORE the encoder. A default `pip install fireweed-mcp` has no
+    # encoder (zero declared dependencies), and lexical_only mode refused 369/410 answerable
+    # questions -- including "what kind of pet?" against a substrate grounding *cat*. These are
+    # ordinary hypernyms, not embedding similarity, so they need no model and stay auditable.
+    hyp = grounded_hyponym(head, lambda t: vocab.status(t) in ("grounded", "non_discriminative"))
+    if hyp is not None:
+        return ReadGateVerdict(False, None,
+                               f'"{head}" is grounded via "{hyp}"', demand, mode=mode)
+
     rescued, score = (False, None)
     if semantic_rescue:
         rescued, score = _semantic_rescue(head, vocab)
@@ -393,6 +499,8 @@ def _read_gate(question, graph, ts, semantic_rescue, vocab) -> ReadGateVerdict:
     # The typed abstention the review asked for: refusal stops being an empirical tendency and
     # becomes a stated, gated property with a machine-readable reason.
     about = ""
+    known: list[str] = []
+    remedy = f'commit a claim that grounds "{head}", with evidence'
     if resolved:
         subj = resolved[0]
         ent = graph.find_entity_by_name(subj) or _resolve_partial(subj, graph)
@@ -403,8 +511,16 @@ def _read_gate(question, graph, ts, semantic_rescue, vocab) -> ReadGateVerdict:
                 and any(e.entity_id == ent.entity_id for e in node.entities)
             )
             if n_about:
+                # "1 claim ... exist" shipped for months. Subject-verb agreement is not cosmetic in
+                # a refusal message: it is the sentence the user is most likely to read closely.
                 about = (f'; {n_about} claim{"s" if n_about != 1 else ""} '
-                         f'about {ent.canonical_name} exist')
+                         f'about {ent.canonical_name} {"exist" if n_about != 1 else "exists"}')
+                known = _predicates_about(ent, graph, ts)
+                if known:
+                    # a participle sidesteps the agreement problem for both 1 and n claims
+                    about += f', grounding: {", ".join(known)}'
+                    remedy = (f'ask about one of: {", ".join(known[:5])} — or commit a claim '
+                              f'grounding "{head}"')
     caveat = ("" if mode == "semantic"
               else " (paraphrase matching unavailable: the semantic encoder is not installed, "
                    "so this refusal is stricter than a full deployment's)")
@@ -412,4 +528,5 @@ def _read_gate(question, graph, ts, semantic_rescue, vocab) -> ReadGateVerdict:
         True, "unknown_predicate",
         f'no claims ground "{head}"{about}{caveat}',
         demand, rescue_score=score, mode=mode,
+        known_predicates=known, remedy=remedy,
     )

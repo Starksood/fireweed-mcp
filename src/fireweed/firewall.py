@@ -11,6 +11,7 @@ import re
 
 from .claim import Claim, FirewallDecision, FirewallResult
 from .constitutional import check as _constitutional_check
+from .lexical_relations import IRREGULAR_VERBS as _IRREGULAR_VERBS
 from .domain_classifier import classify_domains, DOMAIN_KEYWORDS
 
 _GREETING_PREFIXES = ("hi ", "hello", "hey", "good morning", "good evening", "good afternoon")
@@ -21,6 +22,7 @@ _DOMAIN_KW_SET: set[str] = (
 )
 _COPULAS = {"is", "are", "was", "were", "has", "have"}
 _VERB_RE = re.compile(r"\b\w+(?:s|ed|ing|es)\b", re.IGNORECASE)
+
 _IN_LOC_RE = re.compile(r"\bin\s+[A-Z][a-zA-Z]+\b")
 
 _RESCUE_RULES: list[tuple[list[str], set[str]]] = [
@@ -86,7 +88,9 @@ def evaluate(claim: Claim) -> FirewallResult:
         return _reject("too_short")
 
     words = lower.split()
-    if not any(w in _COPULAS for w in words) and not _VERB_RE.search(lower):
+    if (not any(w in _COPULAS for w in words)
+            and not any(w.strip(".,;:!?'\"") in _IRREGULAR_VERBS for w in words)
+            and not _VERB_RE.search(lower)):
         return _reject("fragment")
 
     if "the user said" in lower or "user mentioned" in lower or re.search(r"\bcontent\b", lower):

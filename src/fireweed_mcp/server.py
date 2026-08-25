@@ -41,6 +41,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 
 PROTOCOL_VERSION = "2024-11-05"
+
+
+def safe_source_id(raw: str) -> str:
+    """`source_id` becomes a filename, so it is attacker-controlled path input.
+
+    "../../etc/passwd" raised an unhandled traceback at the caller (it did not escape the store --
+    the write simply failed -- but a stack trace is not an answer). Reduce to a single path
+    component and keep only characters that are safe on POSIX and Windows alike.
+    """
+    import re as _re
+    raw = (raw or "").strip().replace("\\", "/").split("/")[-1]
+    raw = _re.sub(r'[^A-Za-z0-9._-]', "_", raw).lstrip(".")
+    return raw[:120] or "agent"
 STORE = Path(os.environ.get("FIREWEED_MCP_STORE", Path.home() / ".fireweed" / "mcp"))
 SUBSTRATE = STORE / "substrate.json"
 SOURCES = STORE / "sources"
@@ -60,7 +73,20 @@ def fabric():
         SOURCES.mkdir(parents=True, exist_ok=True)
         _fw = Fireweed(llm=lambda _p: "{}")      # no reader model: nothing here needs one
         if SUBSTRATE.exists():
-            _fw.restore(SUBSTRATE.read_bytes())
+            # A truncated or hand-edited substrate must not take the server down on every call.
+            # Quarantine it, say so once, and continue with an empty store -- losing the file is
+            # already bad, and compounding it with an unreadable stack trace helps nobody.
+            try:
+                _fw.restore(SUBSTRATE.read_bytes())
+            except Exception as exc:
+                bad = SUBSTRATE.with_suffix(".corrupt")
+                try:
+                    SUBSTRATE.replace(bad)
+                except OSError:
+                    bad = None
+                print(f"fireweed: could not read {SUBSTRATE} ({type(exc).__name__}: {exc}); "
+                      + (f"moved to {bad}; " if bad else "")
+                      + "starting from an empty store.", file=sys.stderr, flush=True)
     return _fw
 
 
@@ -77,7 +103,7 @@ def tool_remember(args: dict) -> str:
 
     claim = (args.get("claim") or "").strip()
     evidence = (args.get("evidence") or "").strip()
-    source_id = (args.get("source_id") or "agent").strip()
+    source_id = safe_source_id(args.get("source_id") or "agent")
     source_text = args.get("source_text") or ""
     if source_text:
         # Register the document inline. Without this, byte-range receipts -- the headline property --
@@ -116,7 +142,21 @@ def tool_remember(args: dict) -> str:
             ctx.begin_session(source_id)
         except Exception:
             pass
-    ctx.ingest(claim, evidence, 0.9, turn, source_id)
+    result = ctx.ingest(claim, evidence, 0.9, turn, source_id)
+
+    # REPORT WHAT ACTUALLY HAPPENED. This returned "ADMITTED" unconditionally while the engine's
+    # firewall was rejecting the claim, so `remember` told callers their fact was stored when the
+    # substrate had recorded nothing -- silent data loss, in the one product where the record is
+    # the entire promise. Computing a decision and then ignoring it is the same defect this project
+    # has now hit in reader.py, run_opsgraph.py and here.
+    decision = str(getattr(result, "firewall_decision", "") or "").upper()
+    if "REJECT" in decision:
+        reason = getattr(getattr(result, "mutation", None), "reason", None) or "rejected"
+        persist()
+        return (f"NOT STORED ({reason}) — the claim passed the evidence checks but the substrate's "
+                f"firewall declined it.\n  claim   : {claim}\n"
+                f"Nothing was written. Rephrase as a complete statement about a named subject, "
+                f"or use `add_source` for material that is not a single durable fact.")
 
     # Bind a receipt when we hold the source document this evidence came from.
     src = SOURCES / f"{source_id}.txt"
@@ -139,7 +179,7 @@ def tool_remember(args: dict) -> str:
 def tool_add_source(args: dict) -> str:
     """Register a source document so claims from it can carry byte-range receipts."""
     import hashlib
-    source_id = (args.get("source_id") or "").strip()
+    source_id = safe_source_id(args.get("source_id") or "")
     text = args.get("text") or ""
     if not source_id or not text:
         return "REFUSED — `source_id` and `text` are required."
@@ -164,9 +204,18 @@ def tool_recall(args: dict) -> str:
     if r.abstain:
         g = r.gate_verdict
         detail = g.detail if g else "no grounded evidence"
-        return (f"ABSTAINED ({r.abstain_reason}) — {detail}\n"
-                f"This is a refusal, not an empty result. The substrate does not hold an answer to "
-                f"this, and is telling you rather than guessing.")
+        out = [f"ABSTAINED ({r.abstain_reason}) — {detail}",
+               "A refusal, not an empty result: the substrate is telling you it has nothing "
+               "rather than guessing."]
+        # A refusal with no way forward is where an agent caller stops. Give it the next move.
+        remedy = getattr(g, "remedy", "") if g else ""
+        if remedy:
+            out.append(f"Next: {remedy}.")
+        if (g is not None and getattr(g, "mode", "semantic") == "lexical_only"
+                and "encoder is not installed" not in detail):
+            out.append("Note: running without the semantic encoder, so paraphrases of a grounded "
+                       "term are refused. `pip install fireweed-mcp[semantic]` widens recall.")
+        return "\n".join(out)
     lines = [f"{len(r.matched_nodes)} grounded result(s):"]
     for e in r.matched_nodes[:5]:
         n = e.node
