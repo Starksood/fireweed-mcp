@@ -222,7 +222,12 @@ def test_erasure_certificate_discloses_its_own_scope(mcp):
     assert "cipher" in out and "content key destroyed" in out
     # a keyring IS now attached, so node content is genuinely crypto-shredded
     assert "content key destroyed: True" in out
-    assert "AES" in out, "the cipher actually used must be named"
+    # The cipher must be NAMED, whatever it is. Asserting "AES" specifically passed locally, where
+    # `cryptography` happens to be installed, and failed in CI, where it is not and the keystream
+    # fallback runs — an environment-dependent assertion masquerading as a property.
+    cipher_line = next(l for l in out.splitlines() if l.strip().startswith("cipher"))
+    named = cipher_line.split(":", 1)[1].strip()
+    assert named and named != "none", f"the cipher actually used must be named, got {named!r}"
 
 
 def test_signing_key_is_per_install_not_a_source_literal(tmp_path):
