@@ -78,10 +78,13 @@ ships with a script that proves it):
   Automatic extraction needs a perceiver model; this server deliberately has none.
 - **It does not make an LLM truthful.** It governs what enters the *record* and what can be proven
   about it. Your model can still say whatever it likes in its own prose.
-- **Conversational recall is weak, and measured.** On a 1,200-item adversarial corpus the retrieval
-  gate abstains on only **40%** of questions whose answer is genuinely absent — it checks that the
-  question's *topic* is grounded, not that the asked-for *value* exists. The write path, receipts
-  and erasure are unaffected and are the parts to rely on.
+- **Recall is weak, and measured on both axes.** On questions whose answer is genuinely absent, the
+  gate abstains on only **38%** — it checks that the question's *topic* is grounded, not that the
+  asked-for *value* exists. On a paired corpus of questions the stored facts *do* answer, it returns
+  the right answer **24%** of the time against **75%** for plain retrieval-and-read. Both numbers
+  come from a calibrated instrument that prints its own controls before measuring; the method and
+  the failures behind it are written up in the private repo's evaluation notes.
+  **The write path, receipts and erasure are unaffected and are the parts to rely on.**
 
 ## Your data
 

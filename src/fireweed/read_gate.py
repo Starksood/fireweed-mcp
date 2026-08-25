@@ -69,6 +69,12 @@ FUNCTION_WORDS: frozenset[str] = frozenset({
 
 # Wh-words that take a nominal complement: "what BUS", "which SHIFT", "whose FLAT".
 _WH_DETERMINER: frozenset[str] = frozenset({"what", "which", "whose"})
+# PARTITIVE HEADS. "What KIND OF music" asks about music, not about kinds. Taking the token after
+# the wh-word yields `kind`, which appears in no substrate, so the gate refuses EVERY question of
+# this shape unconditionally. Measured before this fix: 4 of 6 answerable categories scored ~0
+# (music 1/152, pet 0/118, work 0/156, diet 0/52) purely because of the phrasing — 478 of 734 rows.
+# The demand is the noun the partitive governs.
+_PARTITIVE: frozenset[str] = frozenset({"kind", "type", "sort", "form", "variety"})
 # Wh-words that demand a typed object rather than naming one.
 _WH_TYPED: dict[str, str] = {"where": "location", "when": "date", "who": "person"}
 # "how many/much/long X" — the demand is the noun, not the degree word.
@@ -136,6 +142,11 @@ def parse_demand(question: str) -> Demand:
     # an unbounded scan swallows the predicate.
     if first in _WH_DETERMINER and len(toks) > 1:
         nxt = toks[1]
+        # "what kind of X" / "what type of X" -> the demand is X
+        if nxt in _PARTITIVE and len(toks) > 3 and toks[2] == "of":
+            for t in toks[3:]:
+                if t not in FUNCTION_WORDS:
+                    return Demand(first, t, None)
         if nxt not in FUNCTION_WORDS:
             np_tokens: list[str] = []
             for t in toks[1:]:

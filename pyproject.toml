@@ -4,11 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fireweed-mcp"
-version = "0.1.2"
+version = "0.1.3"
 description = "Agent memory where every fact carries a receipt — a deterministic gate decides what is remembered, and erasure issues a signed certificate."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { file = "LICENSE.md" }
+# SPDX has no identifier for FSL, so declare it as a LicenseRef and carry the text as
+# a license file. Previously `license = {file=...}` dumped the ENTIRE licence text into
+# PyPI's license field and set no classifier, which is why indexers reported the
+# package as having no detectable licence at all.
+license = "LicenseRef-FSL-1.1-ALv2"
+license-files = ["LICENSE.md"]
 authors = [{ name = "Sanyam Sood" }]
 keywords = ["mcp", "model-context-protocol", "agent-memory", "provenance", "audit", "gdpr", "erasure", "llm"]
 classifiers = [
@@ -16,6 +21,7 @@ classifiers = [
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
   "Topic :: Software Development :: Libraries",
+  "License :: Other/Proprietary License",
 ]
 
 # No dependencies. Nothing here calls an LLM, and the MCP protocol is implemented directly over
