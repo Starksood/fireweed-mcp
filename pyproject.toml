@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fireweed-mcp"
-version = "0.1.4"
+version = "0.2.0"
 description = "Agent memory where every fact carries a receipt — a deterministic gate decides what is remembered, and erasure issues a signed certificate."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -33,6 +33,12 @@ dependencies = []
 # Paraphrase matching in `recall`. Without it the gate still works and refuses MORE — the safe
 # direction — and `memory_stats` reports which mode you are in.
 semantic = ["sentence-transformers>=3.0"]
+
+# Ed25519 signatures for erasure certificates. Without this the certificate is signed with HMAC,
+# which is symmetric: only this install can verify it, so it detects tampering but proves nothing to
+# a third party. With it, the public key is published beside the store and anyone holding it can
+# verify a certificate without being able to forge one. The certificate states which it carries.
+signing = ["cryptography>=42.0"]
 
 [project.scripts]
 fireweed-mcp = "fireweed_mcp.server:main"

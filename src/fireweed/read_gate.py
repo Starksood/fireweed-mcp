@@ -236,13 +236,33 @@ class Vocabulary:
 
 
 def build_vocabulary(graph: GraphState, ts: str | None = None) -> Vocabulary:
+    """Document frequency over active claim content, PLUS each claim's canonical predicate.
+
+    The surface tokens alone are the literal words the source happened to use, which is why the
+    read side needed a growing pile of query-time widening (morphology, hypernyms, an optional
+    encoder) to match a question phrased any other way. Every node already carries a canonical
+    `Predicate(lemma, polarity, object)` -- computed at admission, never read for matching. Indexing
+    it puts the normalized form in the vocabulary at WRITE time: a store that recorded "owns a
+    bookshop" grounds `own` because the lemma says so, not because a query-time rule guessed it.
+
+    Additive, not a replacement: surface tokens stay indexed, so this can only ever raise the floor.
+    """
     df: dict[str, int] = {}
     n = 0
     for node in graph.get_valid_nodes(ts):
         if node.status.memory_state not in ("active", "disputed"):
             continue
         n += 1
-        for t in set(_tokens(node.normalized_claim)):
+        terms = set(_tokens(node.normalized_claim))
+        pred = getattr(node, "predicate", None)
+        if pred is not None:
+            lemma = (getattr(pred, "lemma", None) or "").strip().lower()
+            if lemma and lemma != "unknown":
+                terms.add(lemma)
+            obj = (getattr(pred, "object", None) or "").strip().lower()
+            if obj:
+                terms.update(_tokens(obj))
+        for t in terms:
             df[t] = df.get(t, 0) + 1
     return Vocabulary(df, n)
 

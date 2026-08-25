@@ -146,6 +146,73 @@ def encrypt_node_content(node_dict: dict, keyring: Keyring) -> dict:
     return d
 
 
+# Entity payloads are shaped differently from node payloads: there is no `entities` list to derive a
+# subject from, and `provenance` is a LIST of records rather than one dict. `encrypt_node_content`
+# therefore cannot be pointed at them, which is why ADD_ENTITY events shipped unencrypted and an
+# erased subject's name and sentence survived in the ledger after a completed erasure.
+_ENTITY_FIELDS = ("canonical_name",)
+_ENTITY_PROV_FIELDS = ("source_span",)
+
+
+def encrypt_entity_content(entity_dict: dict, keyring: Keyring) -> dict:
+    """Encrypt an entity's name and provenance spans under ITS OWN key.
+
+    Keying on the entity itself is what makes erasure reach this: destroying that entity's key
+    renders its historical payloads unreadable. An entity that survives erasure keeps its key and
+    its payloads, which is correct -- and is also why the closure now removes entities left with no
+    surviving grounding, since those hold the erased subject's text and nothing else.
+    """
+    subject = entity_dict.get("entity_id")
+    if not subject:
+        return entity_dict
+    key = keyring.get_or_create(subject)
+    d = dict(entity_dict)
+    for f in _ENTITY_FIELDS:
+        if isinstance(d.get(f), str):
+            d[f] = encrypt(key, d[f])
+    prov = d.get("provenance")
+    if isinstance(prov, list):
+        out = []
+        for entry in prov:
+            if isinstance(entry, dict):
+                e = dict(entry)
+                for f in _ENTITY_PROV_FIELDS:
+                    if isinstance(e.get(f), str):
+                        e[f] = encrypt(key, e[f])
+                out.append(e)
+            else:
+                out.append(entry)
+        d["provenance"] = out
+    d["_enc_subject"] = subject
+    return d
+
+
+def decrypt_entity_content(entity_dict: dict, keyring: Keyring) -> dict:
+    """Inverse. A shredded key yields tombstones, exactly as for nodes."""
+    subject = entity_dict.get("_enc_subject")
+    if not subject:
+        return entity_dict
+    key = keyring.get(subject)
+    d = {k: v for k, v in entity_dict.items() if k != "_enc_subject"}
+    for f in _ENTITY_FIELDS:
+        if isinstance(d.get(f), str):
+            d[f] = decrypt(key, d[f]) if key else _TOMBSTONE
+    prov = d.get("provenance")
+    if isinstance(prov, list):
+        out = []
+        for entry in prov:
+            if isinstance(entry, dict):
+                e = dict(entry)
+                for f in _ENTITY_PROV_FIELDS:
+                    if isinstance(e.get(f), str):
+                        e[f] = decrypt(key, e[f]) if key else _TOMBSTONE
+                out.append(e)
+            else:
+                out.append(entry)
+        d["provenance"] = out
+    return d
+
+
 def decrypt_node_content(node_dict: dict, keyring: Keyring) -> dict:
     """Inverse of encrypt_node_content. If the subject's key was shredded, content becomes a tombstone
     — proving the historical record is unrecoverable after erasure."""

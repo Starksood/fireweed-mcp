@@ -2,6 +2,7 @@
 
 Public surface of the MCP release. The full research surface lives in the private repo.
 """
+__version__ = "16.0.0-alpha"
 from .fabric import Fireweed, Session, Turn
 from .retrieval import RetrievalResult, query_graph
 from .grounding import claim_faithful, admissible, classify

@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Union
 
 from .claim import Claim
+from .lexical_relations import base_form
 from .graph import (
     GraphState, Node, normalize_text,
     EntityRef, Predicate, Motivation, MemoryContext,
@@ -127,35 +128,101 @@ _NEGATION_WORDS = {"not", "no", "never", "doesn't", "don't", "won't", "can't", "
 _NEGATIVE_SENTIMENT_WORDS = {"hates", "hate", "dislikes", "dislike", "despises", "despise", "abhors", "abhor", "rejects", "reject", "avoids", "avoid"}
 
 def _extract_predicate(text: str) -> Predicate:
+    """Best-effort (lemma, polarity, object) for a claim.
+
+    Two fixes over the original, both found while wiring predicate matching:
+
+    1. IRREGULAR VERBS. The lemma was derived purely from an -s/-ed/-ing/-es ending, so "wrote",
+       "went", "built", "sold" and the rest of the irregular past tense yielded "unknown" --
+       silently, on the standard write path, for roughly half of ordinary English sentences. This
+       is the same heuristic firewall.py used to reject those sentences as fragments; that was
+       fixed and this copy was never ported.
+    2. PROPER NOUNS. "Marcus Webb owns a bookshop" produced lemma="marcu", because *Marcus* ends in
+       s and came first. A verb is rarely capitalised mid-sentence, so capitalised tokens after the
+       first word are skipped before the suffix rule runs.
+
+    Still a heuristic, not a parser: it has no notion of clause structure and will mis-fire on
+    unusual phrasing. It is used for retrieval matching, where a wrong lemma costs recall, never
+    for admission, where a wrong answer would cost correctness.
+    """
     words = text.split()
-    lw = [w.lower().rstrip(".,!?") for w in words]
-    # Detect negative polarity from explicit negation or negative sentiment verbs
+    lw = [w.lower().rstrip(".,!?;:") for w in words]
+
     polarity = "positive"
     if set(lw) & _NEGATION_WORDS:
         polarity = "negative"
     elif set(lw) & _NEGATIVE_SENTIMENT_WORDS:
         polarity = "negative"
-    lemma = "unknown"
-    for w in lw:
-        if w.endswith(("s", "ed", "ing", "es")) and len(w) > 3:
-            if w.endswith("ing") and len(w) > 5:
-                lemma = w[:-3]
-            elif w.endswith("ed") and len(w) > 4:
-                lemma = w[:-2]
-            elif w.endswith("es") and len(w) > 4:
-                lemma = w[:-2]
-            elif w.endswith("s") and len(w) > 3:
-                lemma = w[:-1]
-            else:
-                lemma = w
-            break
-    obj = None
+
+    # Tokens that may be the verb: not a capitalised token (a claim opens with its subject, so
+    # position 0 is a proper noun far more often than a verb -- exempting it gave "Marcus Webb owns
+    # a bookshop" the lemma "marcu"), and not an auxiliary, which otherwise wins over the verb it is
+    # helping ("does not own a dog" -> "doe").
+    def _candidate(i: int) -> bool:
+        return not words[i][:1].isupper() and lw[i] not in _AUXILIARIES
+
+    lemma, verb_at = "unknown", None
     for i, w in enumerate(lw):
-        if w in (lemma, lemma + "s", lemma + "ed"):
-            if i + 1 < len(lw):
-                obj = lw[i + 1]
+        if not _candidate(i):
+            continue
+        b = base_form(w)
+        if b is not None:
+            lemma, verb_at = b, i
+            break
+    # A bare infinitive after an auxiliary: "does not OWN a dog", "will BUY", "can SWIM". It carries
+    # no inflection at all, so neither the irregular table nor the suffix rule below can see it.
+    if verb_at is None:
+        for i, w in enumerate(lw):
+            if w in _AUXILIARIES:
+                for j in range(i + 1, len(lw)):
+                    if lw[j] in _NEGATION_WORDS or not _candidate(j):
+                        continue
+                    lemma, verb_at = base_form(lw[j]) or lw[j], j
+                    break
+                break
+
+    if verb_at is None:
+        for i, w in enumerate(lw):
+            if not _candidate(i):
+                continue
+            if w.endswith(("s", "ed", "ing", "es")) and len(w) > 3:
+                if w.endswith("ing") and len(w) > 5:
+                    lemma = w[:-3]
+                elif w.endswith("ed") and len(w) > 4:
+                    lemma = w[:-2]
+                elif w.endswith("es") and len(w) > 4 and w[:-2].endswith(("s","x","z","ch","sh")):
+                    # -es is a real two-character plural only after a sibilant: buses, boxes,
+                    # watches. Applying it everywhere turned "likes" into "lik" and "loves" into
+                    # "lov" -- the two most common predicates in the corpus, both mangled.
+                    lemma = w[:-2]
+                elif w.endswith("s") and len(w) > 3:
+                    lemma = w[:-1]
+                else:
+                    lemma = w
+                verb_at = i
+                break
+
+    # The object is the token after the VERB AS IT APPEARED, not after the lemma -- "wrote" lemmatises
+    # to "write", which never occurs in the sentence, so matching on the lemma found nothing.
+    obj = None
+    if verb_at is not None:
+        for j in range(verb_at + 1, len(lw)):
+            if lw[j] in _OBJ_SKIP:
+                continue
+            obj = lw[j]
             break
     return Predicate(lemma=lemma, polarity=polarity, object=obj)
+
+
+# Auxiliaries help another verb; the claim's predicate is the one they help.
+_AUXILIARIES = {"is", "are", "was", "were", "be", "been", "being", "am",
+                "do", "does", "did", "has", "have", "had",
+                "will", "would", "can", "could", "may", "might", "must", "shall", "should"}
+
+# Determiners and prepositions carry no object information: "wrote THE first algorithm" -> algorithm.
+_OBJ_SKIP = {"a", "an", "the", "to", "of", "in", "at", "on", "for", "with", "his", "her", "their",
+             "its", "my", "our", "your", "first", "second", "third", "some", "any", "that", "this"}
+
 
 _MONTH_MAP = {
     "january": "01", "february": "02", "march": "03", "april": "04",

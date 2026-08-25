@@ -154,6 +154,12 @@ def apply_event(ev: "LedgerEvent", graph, keyring=None):
             obj = decrypt_node_content(obj, keyring)
         return fabric._node_from_dict(obj)
 
+    def _entity_obj(obj):
+        if keyring is not None and obj.get("_enc_subject"):
+            from .crypto import decrypt_entity_content
+            obj = decrypt_entity_content(obj, keyring)
+        return obj
+
     graph._replaying = True
     try:
         if op == "ADD_NODE":
@@ -161,9 +167,9 @@ def apply_event(ev: "LedgerEvent", graph, keyring=None):
         elif op == "UPDATE_NODE":
             graph.update_node(_node(ev.payload["obj"]))
         elif op == "ADD_ENTITY":
-            graph.add_entity(fabric._entity_from_dict(ev.payload["obj"]))
+            graph.add_entity(fabric._entity_from_dict(_entity_obj(ev.payload["obj"])))
         elif op == "UPDATE_ENTITY":
-            graph.update_entity(fabric._entity_from_dict(ev.payload["obj"]))
+            graph.update_entity(fabric._entity_from_dict(_entity_obj(ev.payload["obj"])))
         elif op == "ADD_RELATION":
             graph.add_relation(fabric._relation_from_dict(ev.payload["obj"]))
         elif op == "ERASE":

@@ -37,6 +37,13 @@ class Closure:
                 "derived_invalidated": sorted(self.derived_ids)}
 
 
+def name_fingerprint(name: str | None) -> str:
+    """Stable hash of a subject name, for tombstones that must not retain the name itself."""
+    import hashlib
+    n = " ".join((name or "").lower().split())
+    return "sha256:" + hashlib.sha256(n.encode("utf-8")).hexdigest() if n else ""
+
+
 def compute_closure(graph, subject_entity_id: str) -> Closure:
     """Exact transitive closure of a data subject: every node whose entities include the subject, the
     relations incident to those nodes or the subject, and the subject entity itself. Uses the inverted
@@ -81,8 +88,32 @@ def compute_closure(graph, subject_entity_id: str) -> Closure:
         if (rel.source_id == subject_entity_id or rel.target_id == subject_entity_id
                 or rel.source_id in node_ids or rel.target_id in node_ids):
             relation_ids.append(rid)
+    # ORPHANED ENTITIES. An entity mentioned only inside the subject's claims survives the closure
+    # with a provenance list whose `source_span` quotes those claims verbatim -- so erasing "Priya
+    # Raman joined Acme" removed her node and left the entity `Acme` still holding her sentence in
+    # the snapshot. Measured with grep after a completed erasure.
+    #
+    # The reasoning is the same as for derived nodes above: an entity with no surviving grounding is
+    # a stale record, and keeping it means keeping the subject's content. It over-deletes -- an
+    # entity that would have been re-learned from other sources goes too -- and that is the trade
+    # this module already takes deliberately, because over-deletion is recoverable through normal
+    # operation and a leak is not.
+    #
+    # It belongs in the CLOSURE rather than as a post-hoc mutation: the manifest travels in the ERASE
+    # event payload, so a from-zero replay removes exactly the same entities and live-vs-replay
+    # equivalence holds. An earlier attempt that redacted entity spans directly broke that invariant.
+    surviving = [n for n in graph.all_nodes() if n.node_id not in node_ids]
+    still_referenced = {e.entity_id for n in surviving for e in n.entities}
+    doomed_entities = {subject_entity_id}
+    for n in graph.all_nodes():
+        if n.node_id not in node_ids:
+            continue
+        for e in n.entities:
+            if e.entity_id not in still_referenced:
+                doomed_entities.add(e.entity_id)
+
     return Closure(subject_entity_id=subject_entity_id, node_ids=sorted(node_ids),
-                   relation_ids=sorted(relation_ids), entity_ids=[subject_entity_id],
+                   relation_ids=sorted(relation_ids), entity_ids=sorted(doomed_entities),
                    derived_ids=sorted(derived_ids))
 
 
@@ -107,6 +138,8 @@ class Certificate:
                             "(conservative default); a surviving co-subject's own account remains "
                             "re-derivable from their un-erased turns.")
     signature: str = ""
+    public_key: str = ""              # ed25519 only; empty under HMAC, which has no public half
+    adversary_checkable: bool = False  # False means: a checksum, not an attestation
 
     def _signable(self) -> bytes:
         from .ledger import canonical_bytes
@@ -118,14 +151,34 @@ class Certificate:
             "key_destroyed": self.key_destroyed, "key_destroyed_at": self.key_destroyed_at,
         })
 
-    def signed(self, signing_key: bytes) -> "Certificate":
-        sig = hmac.new(signing_key, self._signable(), hashlib.sha256).hexdigest()
-        object.__setattr__(self, "signature", "hmac-sha256:" + sig)
+    def signed(self, signing_key) -> "Certificate":
+        """Sign with a signer object, or with raw bytes for the legacy HMAC path.
+
+        Accepts either so callers holding a 32-byte secret keep working. A signer that declares
+        `adversary_checkable` records its public key on the certificate, because a signature nobody
+        else can check is not evidence and the certificate should say which kind it carries.
+        """
+        signer = signing_key if hasattr(signing_key, "sign") else None
+        if signer is None:
+            sig = hmac.new(signing_key, self._signable(), hashlib.sha256).hexdigest()
+            object.__setattr__(self, "signature", "hmac-sha256:" + sig)
+            return self
+        object.__setattr__(self, "signature", signer.sign(self._signable()))
+        object.__setattr__(self, "public_key", signer.public_key() or "")
+        object.__setattr__(self, "adversary_checkable",
+                           bool(getattr(signer, "adversary_checkable", False)))
         return self
 
-    def verify_signature(self, signing_key: bytes) -> bool:
+    def verify_signature(self, signing_key) -> bool:
+        if hasattr(signing_key, "verify"):
+            return signing_key.verify(self._signable(), self.signature)
         expected = "hmac-sha256:" + hmac.new(signing_key, self._signable(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(self.signature, expected)
+
+    def verify_with_public_key(self, public_key_hex: str) -> bool:
+        """Check this certificate holding ONLY the public key — no secret, no trust in the signer."""
+        from .signing import verify_with_public_key as _v
+        return _v(self._signable(), self.signature, public_key_hex)
 
 
 def _state_hash(graph) -> str:
@@ -236,11 +289,29 @@ def erase(graph, ledger, tenant_id: str, subject_entity_id: str,
     from .ledger import apply_event
 
     before = _state_hash(graph)
+    # Capture the canonical name BEFORE the ERASE is applied -- afterwards the entity is gone and it
+    # cannot be recovered. It goes into the event PAYLOAD rather than being written to graph state,
+    # so a from-zero replay reproduces it and live-vs-replay equivalence holds. This is what lets a
+    # later write ask "was this subject erased?", which the live graph can never answer: the live
+    # graph is exactly where an erased subject is not.
+    _subject_name = None
+    for _e in graph.all_entities():
+        if _e.entity_id == subject_entity_id:
+            _subject_name = getattr(_e, "canonical_name", None)
+            break
     closure = compute_closure(graph, subject_entity_id)
 
     seq = getattr(ledger, "graph_version", lambda t: 0)(tenant_id)
     ev = ledger.record(tenant_id, "ERASE", ts=f"erase:{seq}", event_id=f"{tenant_id}:erase:{seq}",
-                       payload={"subject": subject_entity_id, "closure": closure.manifest()})
+                       payload={"subject": subject_entity_id,
+                                # A HASH, not the name. The tombstone has to remember WHO was erased
+                                # so a later write cannot silently re-admit them -- but storing the
+                                # name puts it in an append-only log that erasure cannot reach,
+                                # which defeats the erasure. A candidate name is hashed the same way
+                                # at check time, so the comparison still works and the ledger never
+                                # holds the plaintext.
+                                "subject_name_hash": name_fingerprint(_subject_name),
+                                "closure": closure.manifest()})
     apply_event(ev, graph)
 
     # crypto-shred (the irreversible act) — only when a keyring backs this substrate
@@ -251,9 +322,18 @@ def erase(graph, ledger, tenant_id: str, subject_entity_id: str,
         key_destroyed = keyring.shred(subject_entity_id)
         key_destroyed_at = datetime.now(timezone.utc).isoformat()
         cipher = crypto.CIPHER
-        scope = ("Certifies erasure of the subject's closure from the active substrate AND the ledger, "
-                 "with the content encryption key DESTROYED — historical ciphertext is unrecoverable "
-                 "(from-zero replay tombstones the subject). Structure + hash-chain integrity retained.")
+        scope = ("Certifies erasure of the subject's closure from the active substrate AND the "
+                 "ledger, with the content encryption key DESTROYED. Every stored CONTENT field "
+                 "about the subject -- claim text, entity names, and the verbatim source spans they "
+                 "were learned from, in the live graph and in the append-only ledger alike -- is "
+                 "unrecoverable; a from-zero replay reconstructs tombstones. Source documents are "
+                 "redacted in place: the subject's sentences are replaced by their Merkle leaf "
+                 "hashes, so other parties' receipts into the same document still verify while the "
+                 "text itself is gone. Entities left with no surviving grounding are removed with "
+                 "the subject. RESIDUAL, disclosed: structural identifiers derived from the subject's "
+                 "name (for example an entity id such as `ent_jane_doe`) persist in the hash-chained "
+                 "ledger, which is append-only by design; the name is recoverable from such an "
+                 "identifier even though no content field survives.")
     else:
         cipher = "none"
         scope = ("Certifies erasure of the subject's closure from the ACTIVE SUBSTRATE and ledger only. "

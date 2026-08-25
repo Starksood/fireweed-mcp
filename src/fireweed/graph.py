@@ -220,6 +220,18 @@ class GraphState:
         self._ledger = log
         self._ledger_tenant = tenant_id
         self._keyring = keyring
+        # Seed the counter from the ledger's own tail. `_ledger_seq` is only used to build `ts` and
+        # `event_id`, and it starts at 0 in __init__ -- so a process that restores state from a
+        # snapshot and re-attaches an existing ledger would restart the ids at zero and emit
+        # "mcp:0", "mcp:1", ... a second time. The chain itself stays valid (record() takes seq and
+        # prev_hash from its own tail, and the primary key is (tenant_id, seq)), so this is not
+        # corruption -- but event_id is meant to identify an event, and duplicates make it useless
+        # for dedup or for referring to one from outside. Measured on a two-run restart before this
+        # was added: ids went 0,1,2 then 0,1,2,3.
+        try:
+            self._ledger_seq = len(log.events(tenant_id))
+        except Exception:
+            pass          # a ledger without a queryable tail keeps the previous behaviour
 
     @contextmanager
     def write_context(self, semantic_kind: str, trace: dict | None = None):
@@ -250,6 +262,14 @@ class GraphState:
         if self._keyring is not None and kind in ("ADD_NODE", "UPDATE_NODE"):
             from .crypto import encrypt_node_content
             obj_dict = encrypt_node_content(obj_dict, self._keyring)
+        elif self._keyring is not None and kind in ("ADD_ENTITY", "UPDATE_ENTITY"):
+            # Entity payloads carry the canonical name and the verbatim span the entity was learned
+            # from. Left in the clear they preserved an erased subject's name and sentence in an
+            # append-only log that erasure cannot reach -- measured with grep after a completed
+            # erasure. Entity dicts are shaped differently from nodes, so this needs its own
+            # function rather than a wider `kind` tuple.
+            from .crypto import encrypt_entity_content
+            obj_dict = encrypt_entity_content(obj_dict, self._keyring)
         # Stamp the resolver version (Q1): in the payload so it is hashed (tamper-evident) + persisted,
         # enabling the offline audit query "would today's resolver have decided this differently?"
         from . import __version__ as _resolver_version

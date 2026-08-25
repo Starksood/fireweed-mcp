@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -41,6 +42,77 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 
 PROTOCOL_VERSION = "2024-11-05"
+
+
+def signer():
+    """The signer for erasure certificates: Ed25519 when available, HMAC otherwise.
+
+    Ed25519 is what makes a certificate mean anything to someone who does not already trust this
+    server: the public key is published beside the store, and a third party holding it can verify a
+    certificate without being able to produce one. HMAC cannot do that -- verification needs the same
+    secret as signing -- so under HMAC the certificate is a tamper-detection checksum and says so.
+
+    `cryptography` is an optional extra (`pip install fireweed-mcp[signing]`), so the default install
+    stays dependency-free and gets the honest weaker guarantee rather than a hand-rolled strong one.
+    """
+    from fireweed.signing import Ed25519Signer, HmacSigner, ed25519_available
+    if ed25519_available():
+        kp = KEYS / "ed25519_key"
+        if kp.exists():
+            return Ed25519Signer(kp.read_bytes())
+        KEYS.mkdir(parents=True, exist_ok=True)
+        raw = Ed25519Signer.generate()
+        import os as _os
+        try:
+            fd = _os.open(str(kp), _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL, 0o600)
+        except FileExistsError:
+            return Ed25519Signer(kp.read_bytes())
+        try:
+            _os.write(fd, raw)
+        finally:
+            _os.close(fd)
+        sg = Ed25519Signer(raw)
+        # The public half is written in the clear ON PURPOSE: it is the artifact a verifier needs,
+        # and publishing it is what separates this from the symmetric scheme.
+        STORE.mkdir(parents=True, exist_ok=True)
+        (STORE / "ed25519_public_key").write_text(sg.public_key() + "\n")
+        return sg
+    return HmacSigner(signing_key())
+
+
+def signing_key() -> bytes:
+    """The per-install key that signs erasure certificates.
+
+    This was the literal b"fireweed-mcp-key" -- a constant in public source. HMAC-SHA256 over a
+    canonical encoding is the right construction and `verify_signature` is constant-time, but a key
+    every reader of the repository already has is not a secret: anyone could mint a validly-signed
+    certificate for any subject and any closure manifest. Against accidental corruption that is a
+    checksum; against the adversary the README invokes ("someone who trusts neither your agent nor
+    this server") it establishes nothing.
+
+    Generated once per install, 32 bytes from `secrets`, stored beside the substrate with owner-only
+    permissions and never in the source tree. Certificates issued before this change do not verify
+    against the new key -- correct, since they were forgeable by construction.
+    """
+    import os as _os
+    import secrets
+    kp = KEYS / "signing_key"
+    if kp.exists():
+        return kp.read_bytes()
+    KEYS.mkdir(parents=True, exist_ok=True)
+    key = secrets.token_bytes(32)
+    # O_EXCL so two servers racing on a fresh store cannot each mint a key and clobber the other --
+    # the loser would then sign certificates that do not verify against the key left on disk. First
+    # writer wins; everyone else reads what it wrote.
+    try:
+        fd = _os.open(str(kp), _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL, 0o600)
+    except FileExistsError:
+        return kp.read_bytes()
+    try:
+        _os.write(fd, key)
+    finally:
+        _os.close(fd)
+    return key
 
 
 def safe_source_id(raw: str) -> str:
@@ -57,6 +129,21 @@ def safe_source_id(raw: str) -> str:
 STORE = Path(os.environ.get("FIREWEED_MCP_STORE", Path.home() / ".fireweed" / "mcp"))
 SUBSTRATE = STORE / "substrate.json"
 SOURCES = STORE / "sources"
+LEDGER_DB = STORE / "ledger.db"
+
+# KEYS LIVE APART FROM THE DATA THEY PROTECT.
+#
+# They used to sit in the store directory next to substrate.json and ledger.db, which quietly voided
+# both guarantees they exist to provide: anyone who could read the data could read the signing key
+# and mint a certificate for any subject, and any backup or `cp -r` of the store taken before an
+# erasure carried the content keys alongside the ciphertext they were meant to shred.
+#
+# A separate directory does not defeat an attacker who already has the whole home directory, and it
+# is not a substitute for a KMS or an OS keychain -- crypto.py's own docstring says as much. What it
+# does fix is the ordinary case: copying, syncing, archiving or sharing the STORE no longer hands
+# over the keys with it. Override with FIREWEED_MCP_KEYS.
+KEYS = Path(os.environ.get("FIREWEED_MCP_KEYS", Path.home() / ".fireweed" / "keys"))
+KEYRING = KEYS / "keyring.json"
 
 
 # ── engine access ─────────────────────────────────────────────────────────────
@@ -72,6 +159,30 @@ def fabric():
         STORE.mkdir(parents=True, exist_ok=True)
         SOURCES.mkdir(parents=True, exist_ok=True)
         _fw = Fireweed(llm=lambda _p: "{}")      # no reader model: nothing here needs one
+
+        # ATTACH THE LEDGER. ledger.py implements a complete append-only hash-chained event log --
+        # gap-free seq, prev_hash chain, canonical serialization, resolver_version stamped into
+        # every payload -- and graph.py has attach_ledger, seal(), and an _emit guard that raises on
+        # an unlogged mutation. None of it had a caller: `attach_ledger` and `seal()` were dead code,
+        # `_sealed` was never True, so _emit took the silent early return and EVERY mutation this
+        # server ever made recorded nothing. Found by an independent audit; see
+        # docs/FINDING_ledger_unwired_no_tombstone.md.
+        #
+        # The keyring goes on here too, because attach_ledger takes it: with a keyring, node CONTENT
+        # is encrypted in the persisted payload, so erasure destroying the key makes the history
+        # unrecoverable rather than merely unreachable.
+        from fireweed.crypto import Keyring
+        from fireweed.ledger_sqlite import SQLiteLedger
+        _keyring = Keyring.deserialize(KEYRING.read_bytes() if KEYRING.exists() else None)
+        _fw._ctx.graph.attach_ledger(SQLiteLedger(str(LEDGER_DB)), tenant_id="mcp",
+                                     keyring=_keyring)
+        # SEAL. After this, a graph mutation with no ledger attached raises instead of silently
+        # passing. The guard existed and was never armed -- `_sealed` was never True anywhere in the
+        # repository -- which is precisely why the unattached ledger went unnoticed for the whole
+        # life of the project. Arming it means the failure can never recur silently: it becomes a
+        # crash on the write, not an absence discovered by an auditor months later.
+        _fw._ctx.graph.seal()
+
         if SUBSTRATE.exists():
             # A truncated or hand-edited substrate must not take the server down on every call.
             # Quarantine it, say so once, and continue with an empty store -- losing the file is
@@ -92,6 +203,12 @@ def fabric():
 
 def persist():
     SUBSTRATE.write_bytes(fabric().snapshot())
+    kr = getattr(fabric()._ctx.graph, "_keyring", None)
+    if kr is not None:
+        KEYS.mkdir(parents=True, exist_ok=True)
+        # The mutable half of crypto-shredding. Erasure deletes a key from here; if this is not
+        # written back, the deletion does not survive the process and the shred is undone on restart.
+        KEYRING.write_bytes(kr.serialize())
 
 
 # ── tools ─────────────────────────────────────────────────────────────────────
@@ -136,13 +253,63 @@ def tool_remember(args: dict) -> str:
 
     fw = fabric()
     ctx = fw._ctx
+
+    # TOMBSTONE. Erasure used to leave no durable trace a later write could consult: erase a
+    # subject, re-propose the identical claim with identical evidence, and it was silently admitted
+    # again as if nothing had happened. Predicted by an independent audit and confirmed live before
+    # the ledger was attached. Now that ERASE events are durable, the write path can ask.
+    #
+    # Deliberately an OVERRIDE, not a hard block: erasure is not a permanent ban on a person ever
+    # being mentioned again -- someone may lawfully re-consent, or the same name may be a different
+    # person. The requirement is that re-admission be a DECISION SOMEONE MAKES, recorded as such,
+    # rather than something that happens quietly because nothing was looking.
+    if not args.get("acknowledge_erasure"):
+        from fireweed.erasure import name_fingerprint
+        erased = _erased_fingerprints(ctx.graph)
+        for name in (_candidate_names(claim) if erased else []):
+            if name_fingerprint(name) in erased:
+                return (f"NOT STORED (previously_erased) — \"{name}\" was erased from this "
+                        f"substrate, and this claim names them again.\n  claim   : {claim}\n"
+                        f"If this is intentional -- re-consent, or a different person with the same "
+                        f"name -- pass acknowledge_erasure=true to admit it. That choice is recorded "
+                        f"in the ledger.")
+
     turn = f"{source_id}_{len(ctx.graph.all_nodes())}"
     if source_id not in getattr(ctx, "_sessions_seen", {}):
         try:
             ctx.begin_session(source_id)
         except Exception:
             pass
-    result = ctx.ingest(claim, evidence, 0.9, turn, source_id)
+    # NARROW THE STORED SPAN TO THE PART THAT SUPPORTS THE CLAIM.
+    #
+    # A caller may quote a whole document as evidence, and the stored provenance span was whatever
+    # they passed. That is how one subject's sentence ended up inside a DIFFERENT subject's stored
+    # record: erase Priya, and her text survived in the span attached to Marcus's claim, because his
+    # evidence blob contained her sentence.
+    #
+    # The checks above have already run against the FULL evidence, so nothing is weakened. This only
+    # decides what is retained, and it re-verifies that the narrowed span still supports the claim
+    # before using it -- if it does not, the full evidence is kept and correctness wins over tidiness.
+    stored_evidence = evidence
+    if len(evidence) > len(claim):
+        from fireweed.merkle import split_parts
+        parts = split_parts(evidence)
+        if len(parts) > 1:
+            ctoks = {t for t in re.split(r"[^a-z0-9]+", claim.lower()) if len(t) > 2}
+            best, score = None, 0.0
+            for part in parts:
+                ptoks = {t for t in re.split(r"[^a-z0-9]+", part.lower()) if len(t) > 2}
+                if not ptoks:
+                    continue
+                v = len(ctoks & ptoks) / len(ctoks | ptoks)
+                if v > score:
+                    best, score = part, v
+            if best and score >= 0.4 and subject_grounded(claim, best) \
+                    and order_preserved(claim, best) and numerals_grounded(claim, best) \
+                    and predicate_grounded(claim, best):
+                stored_evidence = best
+
+    result = ctx.ingest(claim, stored_evidence, 0.9, turn, source_id)
 
     # REPORT WHAT ACTUALLY HAPPENED. This returned "ADMITTED" unconditionally while the engine's
     # firewall was rejecting the claim, so `remember` told callers their fact was stored when the
@@ -165,8 +332,22 @@ def tool_remember(args: dict) -> str:
     node = next((n for n in ctx.graph.all_nodes() if n.claim == claim), None)
     persist()
 
+    # OCCURRENCE, NOT JUST CONTENT. `verify_receipts` re-hashes a source and re-slices a range,
+    # which proves stored content has not drifted -- it structurally cannot catch a write that never
+    # landed, because a dropped fact has no receipt to verify. This read-back is the occurrence
+    # proof, and it was already being computed here (to build the receipt) and its `None` case
+    # discarded: the code printed ADMITTED plus a "no source document registered" line, which is
+    # actively misleading, since it implies the fact was stored but unreceipted when in fact nothing
+    # was stored at all. Reported by review; see docs/FINDING_write_omission_blind_spot.md.
+    if node is None:
+        return (f"NOT STORED (omission) — the claim passed every evidence check and the firewall, "
+                f"but no matching node is present in the substrate on read-back.\n"
+                f"  claim   : {claim}\n"
+                f"Nothing was written. This is a bug in the write path, not a rejection of your "
+                f"claim -- please report it with this claim and evidence.")
+
     cls = classify(claim, evidence)
-    rec = receipt_for(node) if node is not None else None
+    rec = receipt_for(node)
     out = [f"ADMITTED — {claim}", f"  grounding : {cls}"]
     if rec:
         out.append(f"  receipt   : bytes [{rec.byte_start}:{rec.byte_end}] of {rec.doc_hash[:19]}…")
@@ -174,6 +355,34 @@ def tool_remember(args: dict) -> str:
         out.append("  receipt   : turn-bound (no source document registered for this source_id — "
                    "use `add_source` first to get byte-range receipts)")
     return "\n".join(out)
+
+
+def _erased_fingerprints(graph) -> set:
+    """Hashes of subjects with an ERASE event. Empty when no ledger is attached.
+
+    Reads the durable record rather than the live graph, which is the point: the live graph is
+    exactly where an erased subject is NOT, so it cannot answer "was this erased?". Hashes rather
+    than names, because the ledger is append-only and a name written into it would survive the very
+    erasure it records.
+    """
+    led = getattr(graph, "_ledger", None)
+    if led is None:
+        return set()
+    out = set()
+    try:
+        for ev in led.events(getattr(graph, "_ledger_tenant", "local")):
+            if ev.kind == "ERASE":
+                fp = (ev.payload or {}).get("subject_name_hash")
+                if fp:
+                    out.add(fp)
+    except Exception:
+        return set()
+    return out
+
+
+def _candidate_names(claim: str) -> list:
+    """Capitalised runs in a claim — the things that might name a previously erased subject."""
+    return [m.group(0) for m in re.finditer(r"\b[A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)*", claim or "")]
 
 
 def tool_add_source(args: dict) -> str:
@@ -230,26 +439,94 @@ def tool_recall(args: dict) -> str:
     return "\n".join(lines)
 
 
+def load_source(source_id: str):
+    """The source document, as a RedactableDoc, whether or not it has been redacted.
+
+    A source lives as `<id>.txt` until an erasure redacts it, at which point it becomes
+    `<id>.redacted.json` -- a list of parts where the erased subject's sentences are present only as
+    their leaf hash. Both forms produce the SAME Merkle root, which is what lets a bystander's
+    receipt keep verifying across the change.
+    """
+    from fireweed.merkle import RedactableDoc
+    red = SOURCES / f"{source_id}.redacted.json"
+    if red.exists():
+        return RedactableDoc.from_dict(json.loads(red.read_text())), True
+    plain = SOURCES / f"{source_id}.txt"
+    if plain.exists():
+        return RedactableDoc.from_text(plain.read_text()), False
+    return None, False
+
+
+def merkle_receipt_for(node):
+    """A redaction-safe receipt, computed on demand from the source rather than persisted.
+
+    Deliberately not stored on the node: the proof is derivable from the document at any time, and
+    adding fields to Provenance would change every existing snapshot's schema for no gain.
+    """
+    from fireweed.merkle import inclusion_proof, split_parts
+    from fireweed.receipts import Receipt
+    prov = node.provenance
+    source_id = prov.source_turn_id.rsplit("_", 1)[0]
+    doc, _ = load_source(source_id)
+    if doc is None:
+        return None
+    # Bind the PART THAT SUPPORTS THE CLAIM, not the whole evidence blob a caller happened to pass.
+    # `source_span` is often the entire document; a receipt over all of it necessarily breaks when
+    # any other subject in that document is erased, which would defeat the point. The claim's own
+    # supporting sentence is the right unit, and it survives an unrelated redaction.
+    claim_tokens = {t for t in re.split(r"[^a-z0-9]+", node.claim.lower()) if len(t) > 2}
+    best, best_score = None, 0.0
+    for i, e in enumerate(doc.entries):
+        if "text" not in e:
+            continue
+        toks = {t for t in re.split(r"[^a-z0-9]+", e["text"].lower()) if len(t) > 2}
+        if not toks:
+            continue
+        score = len(claim_tokens & toks) / len(claim_tokens | toks)
+        if score > best_score:
+            best, best_score = i, score
+    if best is None or best_score < 0.4:
+        return None            # no part clearly supports this claim: mint nothing rather than guess
+    e = doc.entries[best]
+    return Receipt(quote=e["text"], doc_hash=prov.doc_hash or "", byte_start=0, byte_end=0,
+                   merkle_root=doc.root(), leaf_index=best,
+                   proof=tuple(inclusion_proof(doc.hashes(), best)))
+
+
 def tool_verify(args: dict) -> str:
     """Re-hash the source and re-slice the bytes. The point of a receipt is that it CAN fail."""
     from fireweed.receipts import receipt_for, verify as verify_receipt
     fw = fabric()
-    checked = ok = unheld = 0
+    checked = ok = unheld = redacted_ok = 0
     failures = []
     for n in fw._ctx.graph.all_nodes():
         rec = receipt_for(n)
         if rec is None:
             continue
         checked += 1
-        src = SOURCES / f"{n.provenance.source_turn_id.rsplit('_', 1)[0]}.txt"
-        if not src.exists():
+        source_id = n.provenance.source_turn_id.rsplit("_", 1)[0]
+        doc, was_redacted = load_source(source_id)
+        if doc is None:
             unheld += 1
             continue
-        if verify_receipt(rec, src.read_bytes()):
+        if was_redacted:
+            # The flat byte-range check cannot survive a redaction by construction; the Merkle proof
+            # can, and that is the whole reason it exists.
+            from fireweed.receipts import verify_redactable
+            mrec = merkle_receipt_for(n)
+            if mrec is not None and verify_redactable(mrec, doc):
+                ok += 1
+                redacted_ok += 1
+            else:
+                failures.append(n.claim)
+        elif verify_receipt(rec, (SOURCES / f"{source_id}.txt").read_bytes()):
             ok += 1
         else:
             failures.append(n.claim)
     out = [f"receipts re-verified: {ok}/{checked - unheld} checkable ({unheld} whose source is not held)"]
+    if redacted_ok:
+        out.append(f"  {redacted_ok} verified against a REDACTED source — the erased subject's text "
+                   f"is gone and these receipts still hold.")
     for f in failures:
         out.append(f"  FAILED — {f}")
     if failures:
@@ -260,7 +537,6 @@ def tool_verify(args: dict) -> str:
 def tool_forget(args: dict) -> str:
     """Erasure with exact closure and a signed certificate."""
     from fireweed.erasure import erase, ErasureIncomplete
-    from fireweed.ledger_sqlite import SQLiteLedger
     from fireweed import retrieval
 
     subject = (args.get("subject") or "").strip()
@@ -273,12 +549,76 @@ def tool_forget(args: dict) -> str:
         return f"no subject matching {subject!r} is present in the substrate — nothing to erase."
     probes = [ent.canonical_name, subject]
     try:
-        cert = erase(g, SQLiteLedger(":memory:"), "mcp", ent.entity_id, probes,
-                     lambda gg, q: retrieval.query_graph(q, gg), b"fireweed-mcp-key")
+        # USE THE REAL LEDGER, NOT A THROWAWAY. This passed SQLiteLedger(":memory:") -- so the ERASE
+        # event, the append-only hash-chained record that makes a from-zero fold reconstruct and then
+        # erase, was written to a database discarded when the call returned. After a forget the store
+        # held the closure's absence and no record that an erasure had ever happened. Passing the
+        # attached keyring is what turns this from a removal into a crypto-shred: the subject's
+        # content key is destroyed, so historical ciphertext is unrecoverable.
+        cert = erase(g, g._ledger, "mcp", ent.entity_id, probes,
+                     lambda gg, q: retrieval.query_graph(q, gg), signer(),
+                     keyring=g._keyring)
     except ErasureIncomplete as e:
         return f"NO CERTIFICATE ISSUED — erasure incomplete: {e}\nNothing was removed."
+    # CLEAR A DANGLING SESSION ANCHOR. The anchor is the entity pronouns resolve against ("she" ->
+    # the first person seen). After erasing that person it still held `ent_priya_raman`, which both
+    # leaks the name through the identifier -- an id derived from a name is still personal data --
+    # and points later pronoun resolution at an entity that no longer exists. It lives on the ingest
+    # context rather than in graph_state_dict, so clearing it does not affect the live-vs-replay
+    # fingerprint.
+    erased_ids = set(cert.closure_manifest.get("entity_ids") or []) | {ent.entity_id}
+    if getattr(ctx_of := fw._ctx, "_session_anchor", None) in erased_ids:
+        ctx_of._session_anchor = None
+
+    # REDACT THE SOURCE DOCUMENTS. `forget` operated on the graph and never touched SOURCES/*.txt,
+    # so the erased subject's sentences survived in plaintext in a file beside the substrate -- one
+    # grep recovered them after a "provable erasure".
+    #
+    # An earlier attempt at this was reverted because overwriting the bytes changed the document
+    # hash and broke every OTHER party's receipt into the same file. The Merkle binding removes that
+    # obstacle: a redacted part keeps its leaf hash, the root is unchanged, and a bystander's
+    # inclusion proof still verifies. Their claim survives, their receipt survives, and the erased
+    # text is gone -- all three, which the flat hash could not do.
+    redacted_files = 0
+    redacted_parts = 0
+    if SOURCES.exists():
+        from fireweed.merkle import RedactableDoc
+        needle = ent.canonical_name.lower()
+        for f in sorted(SOURCES.glob("*.txt")):
+            source_id = f.stem
+            doc, _ = load_source(source_id)
+            if doc is None:
+                continue
+            hits = sum(1 for e in doc.entries if "text" in e and needle in e["text"].lower())
+            if not hits:
+                continue
+            before_root = doc.root()
+            new_doc = doc.redact(lambda t: needle in t.lower())
+            assert new_doc.root() == before_root, "redaction must not move the root"
+            (SOURCES / f"{source_id}.redacted.json").write_text(json.dumps(new_doc.as_dict()))
+            f.unlink()          # the plaintext original is the leak; it does not survive
+            redacted_files += 1
+            redacted_parts += hits
+        # A source already redacted by an earlier erasure may still name this subject.
+        for f in sorted(SOURCES.glob("*.redacted.json")):
+            doc = RedactableDoc.from_dict(json.loads(f.read_text()))
+            if not any("text" in e and needle in e["text"].lower() for e in doc.entries):
+                continue
+            hits = sum(1 for e in doc.entries if "text" in e and needle in e["text"].lower())
+            f.write_text(json.dumps(doc.redact(lambda t: needle in t.lower()).as_dict()))
+            redacted_files += 1
+            redacted_parts += hits
+
     persist()
     survivors = [n.claim for n in g.all_nodes() if n.status.memory_state in ("active", "disputed")]
+    # PRINT THE CAVEAT THE CERTIFICATE ALREADY COMPUTES. `erase()` builds a `scope` string stating
+    # exactly what is and is not certified, and with no keyring it says residual plaintext may
+    # persist. This function used to print the signature, the counts and the state hashes -- the
+    # flattering fields -- drop `scope`, `cipher` and `key_destroyed`, and then assert "this
+    # certificate is the artifact a compliance reviewer asks for". The engine wrote the sentence
+    # that prevents the overstatement and the server declined to display it. Same defect as the
+    # ADMITTED-while-rejected bug, in the one place where it changes what a reader believes about a
+    # legal artifact.
     return "\n".join([
         f"ERASED {ent.canonical_name} — certificate issued",
         f"  signature            : {cert.signature}",
@@ -287,9 +627,16 @@ def tool_forget(args: dict) -> str:
         f"  every probe abstains : {cert.battery_all_abstained}",
         f"  state {cert.state_hash_before[:18]}… -> {cert.state_hash_after[:18]}…",
         f"  bystanders surviving : {len(survivors)}",
+        f"  cipher               : {cert.cipher}",
+        f"  content key destroyed: {cert.key_destroyed}",
+        f"  source parts redacted: {redacted_parts} in {redacted_files} document(s)",
+        (f"  verifiable by others : yes — ed25519, public key {cert.public_key[:16]}…"
+         if cert.adversary_checkable else
+         "  verifiable by others : NO — this signature is symmetric (HMAC), so only this server "
+         "can check it. It detects tampering; it does not prove anything to someone who does not "
+         "already trust this server. `pip install fireweed-mcp[signing]` for ed25519."),
         "",
-        "This certificate is the artifact a compliance reviewer asks for. The closure is exact: "
-        "facts derived from the subject go too, and facts about everyone else do not.",
+        f"SCOPE — what this certificate does and does not certify:\n  {cert.scope}",
     ])
 
 
@@ -381,6 +728,29 @@ def respond(msg_id, result=None, error=None):
     sys.stdout.flush()
 
 
+# Verdicts meaning THE REQUESTED OPERATION DID NOT HAPPEN. Signalled structurally via `isError`,
+# not only as prose the caller may or may not read.
+_FAILED_PREFIXES = ("REFUSED", "NOT STORED", "ERROR", "NO CERTIFICATE ISSUED")
+
+
+def _is_error(text: str) -> bool:
+    """True when the call did not do what was asked.
+
+    Review raised this directly: "I'd want the refuse in the handler, not only in the tool the model
+    sees." Previously every verdict -- admitted, refused, and an unhandled traceback alike -- came
+    back in an identical success envelope, so enforcement depended entirely on the calling model
+    reading the prose and choosing to honour it. A harness that summarises tool output before a
+    human sees it could soften or drop a REFUSED with nothing at the protocol level to stop it.
+
+    ABSTAINED is deliberately NOT an error. A grounded refusal to answer is a CORRECT and complete
+    result -- the whole thesis of this system -- and flagging it as a failure would invite exactly
+    the retry-until-a-row-comes-back behaviour the abstention exists to prevent. `recall`'s tool
+    description already tells callers to treat abstention as a real answer; marking it isError
+    would contradict that.
+    """
+    return text.lstrip().startswith(_FAILED_PREFIXES)
+
+
 def handle(msg: dict) -> None:
     method, mid = msg.get("method"), msg.get("id")
     if method == "initialize":
@@ -407,7 +777,7 @@ def handle(msg: dict) -> None:
             # Surface the failure to the agent rather than dying: a memory server that vanishes
             # mid-conversation is worse than one that reports it could not do something.
             text = "ERROR — " + traceback.format_exc(limit=3)
-        respond(mid, {"content": [{"type": "text", "text": text}]})
+        respond(mid, {"content": [{"type": "text", "text": text}], "isError": _is_error(text)})
     elif method == "ping":
         respond(mid, {})
     elif mid is not None:

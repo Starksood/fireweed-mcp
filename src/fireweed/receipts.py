@@ -55,19 +55,67 @@ def locate_span(doc: bytes, quote: str) -> tuple[int, int] | None:
 
 @dataclass(frozen=True)
 class Receipt:
-    """A verifiable provenance receipt for a document-derived claim."""
+    """A verifiable provenance receipt for a document-derived claim.
+
+    `doc_hash` + byte range is the original binding and still verifies exactly as before. The Merkle
+    fields are additive: they bind the same quote to a hash tree over the document's parts, so the
+    document can be REDACTED (an erased subject's sentence replaced by its leaf hash) without
+    invalidating this receipt. Under the flat hash that was impossible -- any edit changed the hash
+    and broke every receipt into the file, which is why erasure had to leave the text in place.
+    """
     quote: str
     doc_hash: str
     byte_start: int
     byte_end: int
+    merkle_root: str = ""
+    leaf_index: int = -1
+    proof: tuple = ()
+
+    @property
+    def redaction_safe(self) -> bool:
+        """True when this receipt survives lawful redaction of another party's text."""
+        return bool(self.merkle_root) and self.leaf_index >= 0
 
     def as_dict(self) -> dict:
-        return {
+        d = {
             "quote": self.quote,
             "doc_hash": self.doc_hash,
             "byte_start": self.byte_start,
             "byte_end": self.byte_end,
         }
+        if self.redaction_safe:
+            d["merkle_root"] = self.merkle_root
+            d["leaf_index"] = self.leaf_index
+            d["proof"] = [list(step) for step in self.proof]
+        return d
+
+
+def verify_redactable(receipt: Receipt, doc) -> bool:
+    """Verify against a possibly-redacted document.
+
+    `doc` may be raw bytes/str, or a RedactableDoc in which some parts have been reduced to their
+    leaf hash. The quote must still be a surviving part, and its inclusion proof must reproduce the
+    root. Redacting SOMEONE ELSE'S part leaves this untouched, which is the entire point.
+    """
+    from .merkle import RedactableDoc, leaf_hash, verify_inclusion
+    if not receipt.redaction_safe:
+        return False
+    if isinstance(doc, (bytes, bytearray)):
+        doc = RedactableDoc.from_text(doc.decode("utf-8"))
+    elif isinstance(doc, str):
+        doc = RedactableDoc.from_text(doc)
+    if doc.root() != receipt.merkle_root:
+        return False
+    entries = doc.entries
+    if not (0 <= receipt.leaf_index < len(entries)):
+        return False
+    entry = entries[receipt.leaf_index]
+    if "text" not in entry:
+        return False                      # our own part was redacted; nothing left to attest
+    if entry["text"] != receipt.quote:
+        return False
+    return verify_inclusion(leaf_hash(entry["text"]), tuple(map(tuple, receipt.proof)),
+                            receipt.merkle_root)
 
 
 def verify(receipt: Receipt, doc: bytes) -> bool:

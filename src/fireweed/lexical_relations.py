@@ -68,14 +68,43 @@ HYPERNYMS: dict[str, frozenset[str]] = {
     "language": frozenset({"english", "spanish", "french", "german", "chinese", "japanese",
                            "korean", "italian", "portuguese", "hindi", "arabic", "russian"}),
 }
+# Diet is its own category and had no entry at all: "what kind of diet does X follow?" against a
+# store holding "I am vegan" was the single largest residual failure (21 of 151).
+HYPERNYMS["diet"] = frozenset({"vegan", "vegetarian", "pescatarian", "keto", "ketogenic", "paleo",
+                               "halal", "kosher", "gluten", "dairy", "carnivore", "omnivore",
+                               "raw", "macrobiotic", "lactose"})
+
+# The categories below were derived from MEASURED failures on the 410-item answerable corpus, not
+# guessed: every key here appeared in a refusal whose answer was already sitting in the store under
+# a term the table knew, just filed under a different heading. "activity" (36) and "living" (25)
+# were the top two -- `sport` already contained *basketball* and `job` already contained *teacher*;
+# neither was reachable because the question's noun was not a key.
+HYPERNYMS["activity"] = HYPERNYMS["sport"] | HYPERNYMS["hobby"] | HYPERNYMS["instrument"]
+HYPERNYMS["pastime"] = HYPERNYMS["activity"]
+HYPERNYMS["doing"] = HYPERNYMS["activity"]
+HYPERNYMS["hobby"] = HYPERNYMS["hobby"] | HYPERNYMS["instrument"] | HYPERNYMS["sport"]
+HYPERNYMS["practice"] = HYPERNYMS["diet"] | HYPERNYMS["activity"]
+HYPERNYMS["living"] = HYPERNYMS["job"]
+HYPERNYMS["career"] = HYPERNYMS["job"]
+HYPERNYMS["employment"] = HYPERNYMS["job"]
+
 HYPERNYMS["color"] = HYPERNYMS["colour"]
 HYPERNYMS["profession"] = HYPERNYMS["job"]
 HYPERNYMS["occupation"] = HYPERNYMS["job"]
-HYPERNYMS["breed"] = HYPERNYMS["pet"]
+# "breed" deliberately maps to actual BREEDS, not to species. Aliasing it to `pet` meant "what
+# breed is X's dog?" was answered by a store that only knew "dog" -- returning the category as if it
+# were the value, which is precisely the typed-value gap this project has documented and not yet
+# closed. A store holding "dog" and asked for a breed should REFUSE.
+HYPERNYMS["breed"] = frozenset({
+    "yorkie", "yorkshire", "labrador", "retriever", "poodle", "beagle", "bulldog", "terrier",
+    "chihuahua", "dachshund", "husky", "corgi", "pug", "boxer", "rottweiler", "doberman",
+    "shepherd", "collie", "spaniel", "pitbull", "mastiff", "dane", "schnauzer", "maltese",
+    "pomeranian", "akita", "malamute", "setter", "pointer", "greyhound", "whippet", "mutt",
+    "tabby", "siamese", "persian", "calico", "ragdoll", "bengal", "sphynx"})
 HYPERNYMS["cuisine"] = HYPERNYMS["food"]
 
 
-def hyponyms_of(head: str) -> frozenset[str]:
+def hyponyms_of(head: str) -> frozenset:
     """Concrete terms that would answer a question whose head is `head`. Empty when unknown."""
     return HYPERNYMS.get(head.lower().strip(), frozenset())
 
@@ -164,3 +193,43 @@ def verb_forms(token: str) -> list[str]:
         out.append(base)
         out.extend(f for f in IRREGULAR_FORMS[base] if f != t)
     return [v for v in dict.fromkeys(out) if v != t]
+
+
+def base_form(token: str) -> str | None:
+    """The infinitive of `token` when it is a known irregular form, else None.
+
+    "wrote" -> "write", "went" -> "go", "built" -> "build". Used by the resolver's predicate
+    extraction, which otherwise derives a lemma purely from -s/-ed/-ing/-es endings and therefore
+    returns "unknown" for every irregular verb in English.
+    """
+    return _INVERSE.get(token.lower().strip())
+
+
+
+# ── Wikidata category vocabularies — TRIED, MEASURED, REJECTED ───────────────
+#
+# Four vocabularies were built from Wikidata (occupation Q12737077, sport Q349, instrument Q34379,
+# diet Q474191), tokenised and filtered, and wired in here. On the two corpora that existed at the
+# time they looked excellent: answerable refusal 8.8% -> 3.4% at zero cost to trap refusal.
+#
+# That was a blind spot, not a result. None of the 1,185 items in the original trap corpus has a
+# question head that is a category key -- they ask for names and amounts (album, team, employer,
+# price) -- so the vocabularies were never under any pressure. A held-out corpus was built where
+# every head IS a category key (bench/abstention_v21/generate_category_traps.py, 594 items over
+# personas the answerable corpus does not use). Under that pressure:
+#
+#     config                answerable   original traps   CATEGORY traps
+#     hand table only             8.8%            73.8%            96.3%
+#     hand + wikidata ALL         3.4%            73.8%            35.7%   <- 60-point collapse
+#     hand + wd diet only         8.8%            73.8%            96.3%   <- identical, no gain
+#     hand + wd diet+sport        8.5%            73.8%            91.9%   <- 0.3 for 4.4
+#
+# Refusal quality tracks vocabulary size almost exactly: diet (71 terms) held at 99.2%, sport
+# (2,543) fell to 71.1%, instrument (3,792) to 4.1%, occupation (6,799) to 0.8%. A vocabulary large
+# enough to be useful is large enough that some term in it appears in almost any persona, and the
+# gate then answers a question whose answer is genuinely absent.
+#
+# No subset was net-positive, so nothing is wired. The build script, the CSVs and the corpus are
+# kept under bench/wikidata/ and bench/abstention_v21/ for the value-typing work, where the same
+# vocabularies may be usable as a TYPE CHECK on a stored value rather than as a matching expansion.
+# See docs/FINDING_category_vocabularies_rejected.md.
