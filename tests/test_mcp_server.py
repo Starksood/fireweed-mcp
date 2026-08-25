@@ -307,3 +307,39 @@ def test_private_keys_do_not_live_in_the_store(mcp, tmp_path):
     # the PUBLIC key is not a secret and belongs with the data — it is what a verifier needs
     if (tmp_path / "keys" / "ed25519_key").exists():
         assert (store / "ed25519_public_key").exists()
+
+
+def test_the_ledger_chain_actually_verifies(mcp, tmp_path):
+    """Asserting the ledger FILE exists pins persistence, not integrity.
+
+    Flagged in an external audit: the previous test checked `ledger.db` was on disk, which a
+    corrupt or forged chain would also satisfy. An append-only log that cannot be shown to be
+    intact is a claim, not evidence.
+    """
+    import sys
+    sys.path.insert(0, str(tmp_path.parent))
+    for c in ("Priya Raman joined Acme in 2019.", "Marcus Webb owns a bookshop."):
+        mcp.tool("remember", {"claim": c, "evidence": c, "source_id": "memo", "source_text": c})
+
+    from fireweed.ledger import verify_chain
+    from fireweed.ledger_sqlite import SQLiteLedger
+
+    events = SQLiteLedger(str(tmp_path / "store" / "ledger.db")).events("mcp")
+    assert events, "the ledger must actually contain the mutations"
+    assert verify_chain(events), "the hash chain must verify, not merely exist"
+    seqs = [e.seq for e in events]
+    assert seqs == list(range(len(seqs))), f"sequence must be gap-free: {seqs}"
+
+
+def test_entity_ids_do_not_embed_the_subjects_name(mcp, tmp_path):
+    """An id derived from a name is personal data, and ids survive erasure by design.
+
+    Content can be encrypted and its key destroyed; a structural identifier in an append-only chain
+    cannot be rewritten. So the id must not carry the name in the first place.
+    """
+    mcp.tool("remember", {"claim": "Priya Raman joined Acme in 2019.",
+                          "evidence": "Priya Raman joined Acme in 2019.",
+                          "source_id": "memo", "source_text": "Priya Raman joined Acme in 2019."})
+    raw = (tmp_path / "store" / "substrate.json").read_text().lower()
+    assert "ent_priya" not in raw, "the entity id must not be derived from the name"
+    assert (tmp_path / "keys" / "id_salt").exists(), "the salt belongs with the keys, not the store"

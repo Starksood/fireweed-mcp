@@ -80,6 +80,26 @@ def signer():
     return HmacSigner(signing_key())
 
 
+def id_salt() -> str:
+    """Per-install salt for opaque entity ids. Generated once, stored with the keys."""
+    import os as _os
+    import secrets
+    sp = KEYS / "id_salt"
+    if sp.exists():
+        return sp.read_text().strip()
+    KEYS.mkdir(parents=True, exist_ok=True)
+    salt = secrets.token_hex(16)
+    try:
+        fd = _os.open(str(sp), _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL, 0o600)
+    except FileExistsError:
+        return sp.read_text().strip()
+    try:
+        _os.write(fd, salt.encode())
+    finally:
+        _os.close(fd)
+    return salt
+
+
 def signing_key() -> bytes:
     """The per-install key that signs erasure certificates.
 
@@ -174,6 +194,12 @@ def fabric():
         from fireweed.crypto import Keyring
         from fireweed.ledger_sqlite import SQLiteLedger
         _keyring = Keyring.deserialize(KEYRING.read_bytes() if KEYRING.exists() else None)
+        # Opaque entity ids. Without this an id is derived from the person's name and survives an
+        # erasure in the append-only ledger, so no amount of content encryption makes the erasure
+        # complete. The salt sits with the keys, so someone holding only a copy of the store cannot
+        # confirm a guessed name against an id.
+        _fw._ctx.graph._id_salt = id_salt()
+
         _fw._ctx.graph.attach_ledger(SQLiteLedger(str(LEDGER_DB)), tenant_id="mcp",
                                      keyring=_keyring)
         # SEAL. After this, a graph mutation with no ledger attached raises instead of silently
@@ -452,9 +478,21 @@ def load_source(source_id: str):
     if red.exists():
         return RedactableDoc.from_dict(json.loads(red.read_text())), True
     plain = SOURCES / f"{source_id}.txt"
-    if plain.exists():
-        return RedactableDoc.from_text(plain.read_text()), False
-    return None, False
+    if not plain.exists():
+        return None, False
+    # Nonces are persisted alongside the document. A receipt binds a Merkle root computed over
+    # nonced leaves, so verification has to reproduce the SAME nonces -- minting fresh ones would
+    # give a different root on every read and every receipt would fail. They are written once, when
+    # the document is first seen.
+    npath = SOURCES / f"{source_id}.nonces.json"
+    if npath.exists():
+        nonces = json.loads(npath.read_text())
+    else:
+        from fireweed.merkle import new_nonce, split_parts
+        nonces = [new_nonce() for _ in split_parts(plain.read_text())]
+        SOURCES.mkdir(parents=True, exist_ok=True)
+        npath.write_text(json.dumps(nonces))
+    return RedactableDoc.from_text(plain.read_text(), nonces=nonces), False
 
 
 def merkle_receipt_for(node):
@@ -597,6 +635,10 @@ def tool_forget(args: dict) -> str:
             assert new_doc.root() == before_root, "redaction must not move the root"
             (SOURCES / f"{source_id}.redacted.json").write_text(json.dumps(new_doc.as_dict()))
             f.unlink()          # the plaintext original is the leak; it does not survive
+            # The nonce sidecar goes too. Surviving leaves carry their own nonce inside the redacted
+            # document; the redacted leaves' nonces must not outlive them, or the retained hash
+            # becomes guessable again and the redaction stops hiding anything.
+            (SOURCES / f"{source_id}.nonces.json").unlink(missing_ok=True)
             redacted_files += 1
             redacted_parts += hits
         # A source already redacted by an earlier erasure may still name this subject.

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fireweed-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Agent memory where every fact carries a receipt — a deterministic gate decides what is remembered, and erasure issues a signed certificate."
 readme = "README.md"
 requires-python = ">=3.9"

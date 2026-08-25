@@ -50,8 +50,25 @@ def split_parts(text: str) -> list[str]:
     return parts or ([text] if text else [])
 
 
-def leaf_hash(part: str) -> str:
-    return hashlib.sha256(_LEAF + part.encode("utf-8")).hexdigest()
+def new_nonce() -> str:
+    """16 random bytes, hex. One per leaf, destroyed when that leaf is redacted."""
+    import secrets
+    return secrets.token_hex(16)
+
+
+def leaf_hash(part: str, nonce: str = "") -> str:
+    """H(0x00 || nonce || part).
+
+    The nonce is what makes a redaction actually hide its content. Without it the retained leaf hash
+    is H(0x00 || part), and a redacted sentence drawn from a small space -- which sentences about
+    people are -- can simply be guessed and confirmed against the hash. The redaction would hide the
+    text from a casual reader and not from anyone motivated.
+
+    A surviving leaf keeps its nonce, because a verifier needs it to recompute the hash. A redacted
+    leaf keeps only the hash: the nonce is destroyed with the plaintext, so there is nothing left to
+    check a guess against.
+    """
+    return hashlib.sha256(_LEAF + nonce.encode("utf-8") + part.encode("utf-8")).hexdigest()
 
 
 def _pair(a: str, b: str) -> str:
@@ -111,11 +128,25 @@ class RedactableDoc:
     entries: tuple  # each: {"text": str} for a surviving part, {"hash": str} for a redacted one
 
     @classmethod
-    def from_text(cls, text: str) -> "RedactableDoc":
-        return cls(tuple({"text": p} for p in split_parts(text)))
+    def from_text(cls, text: str, nonces: list | None = None) -> "RedactableDoc":
+        """Build from plaintext, minting a nonce per part unless supplied.
+
+        `nonces` exists so a caller can rebuild an identical document deterministically -- verifying
+        a stored receipt requires reproducing the same leaf hashes, and a fresh random nonce would
+        produce a different root every time.
+        """
+        parts = split_parts(text)
+        if nonces is None:
+            nonces = [new_nonce() for _ in parts]
+        return cls(tuple({"text": p, "nonce": n} for p, n in zip(parts, nonces)))
 
     def hashes(self) -> list[str]:
-        return [e["hash"] if "hash" in e else leaf_hash(e["text"]) for e in self.entries]
+        return [e["hash"] if "hash" in e else leaf_hash(e["text"], e.get("nonce", ""))
+                for e in self.entries]
+
+    def nonces(self) -> list:
+        """Per-leaf nonces; empty string where a leaf has been redacted and its nonce destroyed."""
+        return [e.get("nonce", "") for e in self.entries]
 
     def root(self) -> str:
         return merkle_root(self.hashes())
@@ -125,7 +156,9 @@ class RedactableDoc:
         out = []
         for e in self.entries:
             if "text" in e and predicate(e["text"]):
-                out.append({"hash": leaf_hash(e["text"])})
+                # Hash only. The nonce is NOT carried over -- retaining it would let anyone who
+                # guesses the sentence confirm the guess, which is the whole thing being prevented.
+                out.append({"hash": leaf_hash(e["text"], e.get("nonce", ""))})
             else:
                 out.append(dict(e))
         return RedactableDoc(tuple(out))

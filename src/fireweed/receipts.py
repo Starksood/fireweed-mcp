@@ -114,8 +114,11 @@ def verify_redactable(receipt: Receipt, doc) -> bool:
         return False                      # our own part was redacted; nothing left to attest
     if entry["text"] != receipt.quote:
         return False
-    return verify_inclusion(leaf_hash(entry["text"]), tuple(map(tuple, receipt.proof)),
-                            receipt.merkle_root)
+    # The leaf's own nonce must go into the hash, or a nonced document never verifies. Missing this
+    # call site when the nonce parameter was added made every receipt fail against a redacted source
+    # while the root still matched -- a confusing failure, because the document was provably intact.
+    return verify_inclusion(leaf_hash(entry["text"], entry.get("nonce", "")),
+                            tuple(map(tuple, receipt.proof)), receipt.merkle_root)
 
 
 def verify(receipt: Receipt, doc: bytes) -> bool:

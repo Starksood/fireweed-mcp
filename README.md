@@ -78,13 +78,30 @@ ships with a script that proves it):
   Automatic extraction needs a perceiver model; this server deliberately has none.
 - **It does not make an LLM truthful.** It governs what enters the *record* and what can be proven
   about it. Your model can still say whatever it likes in its own prose.
-- **Recall is weak, and measured on both axes.** On questions whose answer is genuinely absent, the
-  gate abstains on only **38%** — it checks that the question's *topic* is grounded, not that the
-  asked-for *value* exists. On a paired corpus of questions the stored facts *do* answer, it returns
-  the right answer **24%** of the time against **75%** for plain retrieval-and-read. Both numbers
-  come from a calibrated instrument that prints its own controls before measuring; the method and
-  the failures behind it are written up in the private repo's evaluation notes.
-  **The write path, receipts and erasure are unaffected and are the parts to rely on.**
+- **Recall is the weak half, and the honest number is a split.** An earlier version of this README
+  quoted a single pooled refusal rate. That figure conflated two different failures with different
+  causes, so it is replaced here. Measured on a 410-question corpus where every answer is present in
+  the source material:
+
+  | | items | outcome |
+  |---|---|---|
+  | the answer reached the store | 367 | the gate refuses **6** — a **1.6%** read-side miss |
+  | the answer never reached the store | 43 | the gate refuses 30 (correct), answers 13 |
+
+  So when a fact is actually stored, the gate finds it **98.4%** of the time. Most of what the old
+  pooled number blamed on retrieval was the benchmark's own extraction step losing the fact before
+  it was ever written — an LLM paraphrasing *"I am a lawyer"* into *"works at a law firm"* and
+  destroying the word. This server has no such step; it refuses that paraphrase outright.
+
+  On absent-answer traps the gate correctly refuses **73.8%**, and on a held-out corpus built
+  specifically to attack the category-matching layer, **96.3%**. The remaining trap misses are the
+  typed-value gap: the gate checks that the question's *topic* is grounded, not that the asked-for
+  *value* exists.
+
+  Numbers come from a calibrated instrument that prints its own controls before measuring. The
+  corpora and method live in the private evaluation repo, so treat these as reported rather than
+  independently checkable — the write path, receipts and erasure are the parts you can verify
+  yourself with the commands above.
 
 ## Your data
 

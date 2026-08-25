@@ -1,5 +1,35 @@
 """Sprint 5 (§4B weeks 4–5, 4b) — crypto-shredding for right-to-erasure.
 
+A NOTE ON THE FALLBACK CIPHER, because this file and signing.py answer the same question two
+different ways and only one of them used to show its working.
+
+With `cryptography` installed, content is encrypted with AES-256-GCM: standard, authenticated,
+reviewed. Without it, `encrypt` falls back to XOR against an HMAC-SHA256 counter keystream, tagged
+`enc1:` and reported honestly as such on the certificate. That is a hand-rolled construction, and
+signing.py explicitly REFUSES to hand-roll Ed25519 on the grounds that "hand-written cryptography in
+a product whose entire pitch is verifiability is the wrong trade". An external audit noticed the
+inconsistency, correctly.
+
+Why the fallback is nonetheless kept, stated so the reasoning can be argued with:
+
+  - HMAC-SHA256 in counter mode is a PRF-based stream cipher, not an invented primitive. The
+    composition is standard even though this implementation of it is not reviewed.
+  - It is unauthenticated, which normally disqualifies a cipher. Here the ledger's own hash chain
+    covers the ciphertext payload, so tampering breaks the chain and is detected by a different
+    mechanism.
+  - The property being defended is confidentiality-after-key-destruction, which does not depend on
+    authentication.
+  - The alternative is worse in a specific way: refusing to encrypt without the extra would leave
+    the default install storing erased content in PLAINTEXT, and a hand-rolled keystream is
+    materially better than no encryption at all. signing.py faced the opposite trade -- its weak
+    option (HMAC) is genuinely useless against an adversary, so shipping it honestly labelled cost
+    nothing.
+
+If that reasoning is wrong the fix is to make `cryptography` a hard dependency, and the argument
+against that is only the zero-dependency promise. It is a defensible trade, not an obviously
+correct one, and it is written here so the next reader does not have to reconstruct it.
+
+
 The GDPR-defensible way to erase from an append-only, hash-chained ledger: encrypt a subject's content
 at write time, store only CIPHERTEXT in the immutable payload (so the hash + chain stay valid forever),
 keep the KEYS in a separate mutable keyring, and erase = delete the key. The historical content then

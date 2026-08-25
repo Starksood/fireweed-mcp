@@ -341,7 +341,25 @@ def _resolve(mention: str, graph: GraphState) -> Entity | None:
 
 def _create_entity(mention: str, claim_text: str, source_turn_id: str,
                    source_span: str, graph: GraphState) -> Entity:
-    base_id = "ent_" + mention.lower().replace(" ", "_")
+    # OPAQUE IDS. This was `"ent_" + mention.lower().replace(" ", "_")`, so an entity id embedded the
+    # person's name -- and ids are structural, appearing in relations and node entity-refs throughout
+    # an append-only ledger that erasure cannot rewrite. Every content field could be encrypted and
+    # shredded and `ent_jane_doe` would still be sitting in the chain afterwards. An identifier
+    # derived from a name is personal data.
+    #
+    # A bare hash would not fix it: sha256("Jane Doe") is computable by anyone who guesses the name.
+    # The salt is per-install and lives with the keys rather than the store, so a party holding a
+    # copy of the substrate cannot confirm a guess. Within one install the mapping stays
+    # deterministic, which resolver purity requires.
+    salt = getattr(graph, "_id_salt", "") or ""
+    if salt:
+        import hashlib
+        digest = hashlib.sha256((salt + "\x00" + mention.lower().strip()).encode("utf-8")).hexdigest()
+        base_id = "ent_" + digest[:20]
+    else:
+        # No salt configured: keep the legacy readable form. Existing stores stay loadable and the
+        # engine remains usable standalone, but the name is recoverable from the id.
+        base_id = "ent_" + mention.lower().replace(" ", "_")
     entity_id, suffix = base_id, 2
     while True:
         try:

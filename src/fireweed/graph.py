@@ -205,6 +205,9 @@ class GraphState:
         self._replaying = False
         self._sealed = False
         self._keyring = None     # Sprint 5 4b: when set, node CONTENT is crypto-shredded in payloads
+        # Per-install secret that makes entity ids opaque instead of name-derived. Lives with the
+        # keys, not the store, so a copy of the substrate cannot be used to confirm a guessed name.
+        self._id_salt = ""
         self._write_semantic: tuple[str, dict | None] | None = None   # (semantic_kind, trace)
 
     def seal(self) -> None:

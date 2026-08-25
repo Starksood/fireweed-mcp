@@ -330,10 +330,13 @@ def erase(graph, ledger, tenant_id: str, subject_entity_id: str,
                  "redacted in place: the subject's sentences are replaced by their Merkle leaf "
                  "hashes, so other parties' receipts into the same document still verify while the "
                  "text itself is gone. Entities left with no surviving grounding are removed with "
-                 "the subject. RESIDUAL, disclosed: structural identifiers derived from the subject's "
-                 "name (for example an entity id such as `ent_jane_doe`) persist in the hash-chained "
-                 "ledger, which is append-only by design; the name is recoverable from such an "
-                 "identifier even though no content field survives.")
+                 "the subject. Redacted parts retain only a per-leaf salted hash, so a removed "
+                 "sentence cannot be confirmed by guessing it. Entity identifiers are opaque, salted "
+                 "per install, so no structural identifier in the append-only ledger carries the "
+                 "subject's name. SCOPE LIMITS: this certifies one substrate held by one operator. "
+                 "It says nothing about copies taken before the erasure, and the salt and content "
+                 "keys are held by that same operator -- a party who holds both the store and the "
+                 "keys is not the adversary this defends against.")
     else:
         cipher = "none"
         scope = ("Certifies erasure of the subject's closure from the ACTIVE SUBSTRATE and ledger only. "
