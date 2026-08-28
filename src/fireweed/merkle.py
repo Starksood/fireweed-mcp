@@ -33,6 +33,8 @@ from dataclasses import dataclass
 # Domain separation: a leaf and an interior node must never hash identically, or an attacker could
 # present an interior digest as if it were a leaf (the classic second-preimage attack on naive
 # Merkle trees).
+# RFC 6962 §2.1 domain separation: a leaf and an interior node must never hash identically, or an
+# interior digest can be presented as a leaf (the second-preimage attack on naive Merkle trees).
 _LEAF = b"\x00"
 _NODE = b"\x01"
 
@@ -68,7 +70,17 @@ def leaf_hash(part: str, nonce: str = "") -> str:
     leaf keeps only the hash: the nonce is destroyed with the plaintext, so there is nothing left to
     check a guess against.
     """
-    return hashlib.sha256(_LEAF + nonce.encode("utf-8") + part.encode("utf-8")).hexdigest()
+    # LENGTH-PREFIXED, not merely concatenated. `_LEAF || nonce || part` is ambiguous: a nonce of
+    # "a" with part "bc" hashes identically to an empty nonce with part "abc", and both occur here
+    # because a redacted leaf carries no nonce while a surviving one does. Encoding the nonce length
+    # as a fixed 4-byte big-endian field makes the parse unique, which is what the 0x00/0x01 domain
+    # separation is for in the first place (RFC 6962 §2.1) -- prefixes only buy unambiguity if
+    # everything after them is unambiguously delimited too. Raised in review; verified as a real
+    # collision before the fix.
+    nb = nonce.encode("utf-8")
+    return hashlib.sha256(
+        _LEAF + len(nb).to_bytes(4, "big") + nb + part.encode("utf-8")
+    ).hexdigest()
 
 
 def _pair(a: str, b: str) -> str:

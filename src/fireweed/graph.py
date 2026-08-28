@@ -24,6 +24,21 @@ class Predicate:
     polarity: Literal["positive", "negative", "neutral"]
     object: str | None                               # Direct object, if present.
 
+    # The typed slot, from the authored vocabulary in `predicate_vocabulary.py`. Attached by the
+    # one-directional gate in `predicate_extraction.py` AFTER grounding has already admitted the
+    # claim, so all six fields being None is an ordinary, expected state: it means the claim is
+    # indexed by its literal surface form only, exactly as every claim was before this existed.
+    # Never a refusal, never a force-fit. See docs/FINDING_predicate_representation.md.
+    #
+    # Flat rather than nested so `Predicate(**d)` still round-trips a snapshot written by an older
+    # version — a missing key simply takes its default.
+    slot: str | None = None                          # e.g. "employer"; None = untyped
+    slot_span: str | None = None                     # the evidence text that justified the slot
+    slot_start: int | None = None                    # offsets into the ADMITTED EVIDENCE SPAN,
+    slot_end: int | None = None                      #   i.e. into provenance.source_span
+    slot_vocabulary: str | None = None               # vocabulary version that produced the label
+    slot_proposer: str | None = None                 # "bootstrap" | "model"
+
 
 @dataclass
 class Motivation:

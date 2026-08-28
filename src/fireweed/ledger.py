@@ -24,12 +24,19 @@ from typing import Any
 RESOLVER_KINDS = ("CREATE", "DEDUP", "REINFORCE", "MODIFY", "DISPUTE", "NOOP")
 ENGINE_KINDS = ("SYNTHESIZE", "COMPRESS", "PRUNE", "SEED", "ALIAS_MERGE", "ENTITY_UPSERT")
 LIFECYCLE_KINDS = ("ERASE", "CHECKPOINT")
+# Audit-grain: facts about the store's inputs that are NOT graph mutations. `ADD_SOURCE` records a
+# source document's arrival — its hash, its size, and the caller's declared provenance for it.
+# Deliberately NOT in WRITE_KINDS/_OP_KINDS: replay skips it (see SQLiteLedger.replay's filter),
+# because applying it would change no graph state and adding it to the fold would break the
+# live-vs-replay fingerprint equivalence `seal()` exists to guarantee. It is chained and
+# hash-verified like every other event; it simply materialises nothing.
+AUDIT_KINDS = ("ADD_SOURCE",)
 # Write-grain kinds: the concrete graph mutation captured at the raw-writer boundary. Replay uses
 # these (byte-identical because the object — with its already-realized uuids/timestamps — is stored,
 # so a resolver change or wall-clock never rewrites history). The semantic RESOLVER/ENGINE kinds ride
 # as audit metadata on the same events (payload.semantic / trace).
 WRITE_KINDS = ("ADD_NODE", "UPDATE_NODE", "ADD_ENTITY", "UPDATE_ENTITY", "ADD_RELATION")
-EVENT_KINDS = frozenset(RESOLVER_KINDS + ENGINE_KINDS + LIFECYCLE_KINDS + WRITE_KINDS)
+EVENT_KINDS = frozenset(RESOLVER_KINDS + ENGINE_KINDS + LIFECYCLE_KINDS + WRITE_KINDS + AUDIT_KINDS)
 
 GENESIS_PREV_HASH = ""   # prev_hash of seq 0
 

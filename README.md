@@ -52,6 +52,7 @@ No dependencies. No API keys. No model — nothing in this server calls an LLM.
 | `remember` | admits a claim **only if the evidence you cite supports it**. Refusals are typed and say what to fix. |
 | `recall` | grounded claims **with the byte range they came from**; abstains and names the term it could not ground |
 | `verify_receipts` | re-hash every source, re-slice every range — **tamper-evident** |
+| `trace_evidence` | audit one memory **backwards** to its evidence's arrival: the bytes it binds, whether they still match, the ledger event that recorded the document, and whether the chain verifies |
 | `forget` | erasure with exact closure and a **signed certificate**; bystanders survive |
 | `export_memory` | the whole substrate as a portable open-format blob |
 
@@ -78,30 +79,37 @@ ships with a script that proves it):
   Automatic extraction needs a perceiver model; this server deliberately has none.
 - **It does not make an LLM truthful.** It governs what enters the *record* and what can be proven
   about it. Your model can still say whatever it likes in its own prose.
-- **Recall is the weak half, and the honest number is a split.** An earlier version of this README
-  quoted a single pooled refusal rate. That figure conflated two different failures with different
-  causes, so it is replaced here. Measured on a 410-question corpus where every answer is present in
-  the source material:
+- **Recall is the weak half, and the honest number is far worse than this page used to claim.**
+  A previous version of this README said the gate finds a stored fact **98.4%** of the time. That
+  figure is withdrawn. It was measured on a corpus whose fourteen question phrasings *all* have a
+  matching entry in the hand-written category table that answers them — because those entries were
+  derived from that same corpus's failures. It measured the table's coverage of one question set,
+  not the system's recall.
 
-  | | items | outcome |
-  |---|---|---|
-  | the answer reached the store | 367 | the gate refuses **6** — a **1.6%** read-side miss |
-  | the answer never reached the store | 43 | the gate refuses 30 (correct), answers 13 |
+  Measured 2026-08-27 against a corpus held out on **both** axes — unseen personas and, crucially,
+  unseen question phrasings:
 
-  So when a fact is actually stored, the gate finds it **98.4%** of the time. Most of what the old
-  pooled number blamed on retrieval was the benchmark's own extraction step losing the fact before
-  it was ever written — an LLM paraphrasing *"I am a lawyer"* into *"works at a law firm"* and
-  destroying the word. This server has no such step; it refuses that paraphrase outright.
+  | asked with… | default install refuses |
+  |---|---|
+  | the phrasings the table was built from | 4.8% |
+  | phrasings it has never seen | **99.2%** |
 
-  On absent-answer traps the gate correctly refuses **73.8%**, and on a held-out corpus built
-  specifically to attack the category-matching layer, **96.3%**. The remaining trap misses are the
-  typed-value gap: the gate checks that the question's *topic* is grounded, not that the asked-for
-  *value* exists.
+  A default install answers almost nothing phrased in words nobody tuned for. That is the number
+  that describes the system, and it replaces every recall claim this page previously made.
+
+- **What is genuinely strong is the other axis.** On absent-answer traps the gate correctly refuses
+  **96.1%** — it is far better at declining than at answering, and it does not fabricate. If you
+  need a memory that never invents, this is that. If you need one that reliably finds things, it
+  is not there yet, and the number above is why.
+
+- **It does not yet handle multi-subject questions with scope.** Questions naming exactly one
+  subject are scoped to that subject; questions naming two or more still match against the whole
+  store.
 
   Numbers come from a calibrated instrument that prints its own controls before measuring. The
   corpora and method live in the private evaluation repo, so treat these as reported rather than
-  independently checkable — the write path, receipts and erasure are the parts you can verify
-  yourself with the commands above.
+  independently checkable — the write path, receipts, provenance and erasure are the parts you can
+  verify yourself with the commands above.
 
 ## Your data
 
@@ -110,8 +118,13 @@ ships with a script that proves it):
 the standard library alone. Your memory outlives this server, this engine, and any model. A test
 asserts that round trip.
 
-Optional: `pip install "fireweed-mcp[semantic]"` enables paraphrase matching in `recall`. Without
-it the gate refuses *more* — the safe direction — and `memory_stats` tells you which mode you're in.
+**Do not install `fireweed-mcp[semantic]`.** It enables paraphrase matching in `recall`, and
+measured against the absent-answer traps it collapses correct refusal from **96.1% to 32.8%** — it
+answers two thirds of questions whose answer is simply not in the store. A threshold sweep found no
+setting where it buys recall without that cost: tightened far enough to be safe, it contributes
+nothing at all. It stays installable because the mechanism may be salvageable when scoped to a
+subject's own predicates, which is untested. Until then it is off, and `memory_stats` tells you
+which mode you are in.
 
 ## License
 

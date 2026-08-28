@@ -150,6 +150,7 @@ STORE = Path(os.environ.get("FIREWEED_MCP_STORE", Path.home() / ".fireweed" / "m
 SUBSTRATE = STORE / "substrate.json"
 SOURCES = STORE / "sources"
 LEDGER_DB = STORE / "ledger.db"
+QUARANTINE_LOG = STORE / "quarantine.jsonl"
 
 # KEYS LIVE APART FROM THE DATA THEY PROTECT.
 #
@@ -343,6 +344,33 @@ def tool_remember(args: dict) -> str:
     # the entire promise. Computing a decision and then ignoring it is the same defect this project
     # has now hit in reader.py, run_opsgraph.py and here.
     decision = str(getattr(result, "firewall_decision", "") or "").upper()
+
+    # QUARANTINE MEANS "LOG FOR REVIEW", SO LOG IT. The firewall documents this verdict as "too
+    # unclear → log for review", and it took the same branch as REJECT: no node, no log, no review
+    # surface, and the caller told only in the response text. A documented queue that does not exist
+    # is worse than an undocumented drop, because an operator reasonably assumes someone can go and
+    # look. Flagged twice in an external audit.
+    if "QUARANTINE" in decision:
+        import datetime
+        try:
+            STORE.mkdir(parents=True, exist_ok=True)
+            with QUARANTINE_LOG.open("a") as fh:
+                fh.write(json.dumps({
+                    "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "claim": claim,
+                    "evidence": evidence,
+                    "source_id": source_id,
+                    "reason": getattr(getattr(result, "mutation", None), "reason", None)
+                              or "too_unclear",
+                }) + "\n")
+        except OSError:
+            pass          # an unwritable store must not turn a quarantine into a crash
+        persist()
+        return (f"QUARANTINED — the claim passed the evidence checks but the substrate's firewall "
+                f"could not classify it confidently.\n  claim   : {claim}\n"
+                f"Nothing was written. It is recorded in {QUARANTINE_LOG.name} for review; "
+                f"`review_quarantine` lists what is waiting.")
+
     if "REJECT" in decision:
         reason = getattr(getattr(result, "mutation", None), "reason", None) or "rejected"
         persist()
@@ -411,19 +439,180 @@ def _candidate_names(claim: str) -> list:
     return [m.group(0) for m in re.finditer(r"\b[A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)*", claim or "")]
 
 
+def tool_review_quarantine(args: dict) -> str:
+    """The review surface the firewall's QUARANTINE verdict has always implied."""
+    limit = int(args.get("limit") or 20)
+    if not QUARANTINE_LOG.exists():
+        return "no quarantined claims — nothing has been held for review."
+    rows = [json.loads(l) for l in QUARANTINE_LOG.read_text().splitlines() if l.strip()]
+    if not rows:
+        return "no quarantined claims — nothing has been held for review."
+    out = [f"{len(rows)} claim(s) held for review (showing up to {limit}):"]
+    for r in rows[-limit:]:
+        out.append(f"  · {r.get('claim','')}")
+        out.append(f"      reason: {r.get('reason')} · source: {r.get('source_id')} "
+                   f"· {r.get('at','')[:19]}")
+    out.append("")
+    out.append("These were NOT stored. Re-submit a rephrased claim with `remember` to admit one.")
+    return "\n".join(out)
+
+
 def tool_add_source(args: dict) -> str:
-    """Register a source document so claims from it can carry byte-range receipts."""
-    import hashlib
+    """Register a source document, and record its ARRIVAL in the append-only ledger.
+
+    Before this recorded anything, a document was written to disk and the ledger never learned it
+    existed — every claim binding was chained, the evidence's arrival was not. So "audit backwards
+    from a stored memory to where its evidence came from" had no record to land on. Now it does.
+
+    The declared provenance fields are caller-supplied and unverified, and the tool says so on every
+    call rather than letting the presence of an `origin` field imply someone checked it.
+    """
+    import datetime
+    from fireweed.source_provenance import make_record, ORIGIN_KINDS
+
     source_id = safe_source_id(args.get("source_id") or "")
     text = args.get("text") or ""
     if not source_id or not text:
         return "REFUSED — `source_id` and `text` are required."
+
     STORE.mkdir(parents=True, exist_ok=True)
     SOURCES.mkdir(parents=True, exist_ok=True)
     (SOURCES / f"{source_id}.txt").write_text(text)
-    h = hashlib.sha256(text.encode()).hexdigest()
-    return (f"registered {source_id} — {len(text)} bytes, sha256:{h[:16]}…\n"
-            f"Claims remembered against this source_id now bind to byte ranges in it.")
+
+    fw = fabric()
+    ledger = getattr(fw._ctx.graph, "_ledger", None)
+    rec = make_record(
+        source_id=source_id, text=text,
+        ingested_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        origin=args.get("origin") or "",
+        origin_kind=args.get("origin_kind") or "unknown",
+        supplied_by=args.get("supplied_by") or "",
+        validated_by=args.get("validated_by") or "",
+    )
+
+    seq = "not recorded (no ledger attached)"
+    if ledger is not None:
+        ev = ledger.record("mcp", "ADD_SOURCE", ts=rec.ingested_at,
+                           event_id=f"mcp:add_source:{rec.doc_hash[:16]}",
+                           payload=rec.to_payload())
+        seq = f"ledger seq {ev.seq}, chained to {ev.prev_hash[:12] or 'GENESIS'}…"
+
+    warn = ""
+    if (args.get("origin_kind") or "unknown") not in ORIGIN_KINDS:
+        warn = f"\n  note      : origin_kind not one of {ORIGIN_KINDS}; recorded as 'unknown'."
+
+    return (f"registered {source_id} — {rec.byte_length} bytes, sha256:{rec.doc_hash[:16]}…\n"
+            f"  arrival   : {seq}\n"
+            f"  origin    : {rec.origin} ({rec.origin_kind}), from {rec.supplied_by}, "
+            f"validated by {rec.validated_by}\n"
+            f"Claims remembered against this source_id now bind to byte ranges in it.{warn}\n\n"
+            + rec.disclosure())
+
+
+def tool_trace_evidence(args: dict) -> str:
+    """Audit BACKWARDS from a stored memory to the arrival of the evidence it rests on.
+
+    Answers, for one claim, the four questions that together are what "prove the evidence was legit
+    at write time" can actually mean here — and separates the one it cannot answer:
+
+        1. what bytes does this memory rest on          receipt: doc_hash + byte range
+        2. are those bytes still what they were         re-hash the source now
+        3. is the document's arrival in the chain       the ADD_SOURCE event, and its seq
+        4. does the chain itself verify                 prev_hash linkage, genesis to head
+
+    What it deliberately does NOT claim: that the declared provenance is true, or that the recorded
+    time is the real time. Both are caller-supplied. Printing them beside three verified facts
+    without saying which is which is how an audit trail becomes theatre.
+    """
+    from fireweed.source_provenance import (doc_hash as _dh, normalize_hash as _nh,
+                                            ATTESTED_FIELDS, DECLARED_FIELDS)
+
+    needle = (args.get("claim") or "").strip()
+    if not needle:
+        return "REFUSED — `claim` is required (any distinctive substring of the stored claim)."
+
+    fw = fabric()
+    graph = fw._ctx.graph
+    hits = [n for n in graph.all_nodes()
+            if needle.lower() in n.claim.lower()
+            and n.status.memory_state in ("active", "disputed")]
+    if not hits:
+        return f"NOT FOUND — no active claim matching {needle!r}."
+    if len(hits) > 1:
+        listing = "\n".join(f"  - {n.claim}" for n in hits[:8])
+        return f"AMBIGUOUS — {len(hits)} claims match {needle!r}:\n{listing}\nNarrow the substring."
+
+    node = hits[0]
+    p = node.provenance
+    out = [f"TRACE — {node.claim}", ""]
+
+    # 1. the binding
+    if p.doc_hash is None:
+        out += ["1. binding      : TURN-BOUND — no source document was registered for this claim.",
+                f"   evidence span: {p.source_span!r}",
+                "   There is nothing to audit backwards to. The evidence is the conversation turn,",
+                "   which this store did not independently record. Register sources with",
+                "   `add_source` before `remember` if you need this chain to exist."]
+        return "\n".join(out)
+
+    out += [f"1. binding      : bytes [{p.byte_start}:{p.byte_end}] of doc {p.doc_hash[:16]}…",
+            f"   quoted span  : {p.source_span!r}"]
+
+    # 2. do the bytes still match
+    src = None
+    for f in sorted(SOURCES.glob("*.txt")) if SOURCES.exists() else []:
+        if _dh(f.read_text()) == _nh(p.doc_hash):
+            src = f
+            break
+    if src is None:
+        out += ["2. bytes now    : SOURCE MISSING OR CHANGED — no held document hashes to that value.",
+                "   The receipt cannot be checked. This is a real failure, not a warning."]
+    else:
+        text = src.read_text()
+        sliced = text[p.byte_start:p.byte_end]
+        ok = sliced == p.source_span
+        out += [f"2. bytes now    : {'MATCH' if ok else 'MISMATCH'} — {src.name} still hashes to "
+                f"{p.doc_hash[:16]}…",
+                f"   re-sliced    : {sliced!r}" + ("" if ok else "   <-- differs from the stored span")]
+
+    # 3. the arrival event
+    ledger = getattr(graph, "_ledger", None)
+    events = []
+    if ledger is not None and hasattr(ledger, "events"):
+        try:
+            events = ledger.events("mcp")
+        except TypeError:
+            events = ledger.events()
+    ev = next((e for e in events
+               if e.kind == "ADD_SOURCE"
+               and _nh(e.payload.get("doc_hash", "")) == _nh(p.doc_hash)), None)
+    if ev is None:
+        out += ["3. arrival      : NOT IN THE LEDGER — this document was registered before source",
+                "   arrivals were recorded, or was written to the store directly. The claim's",
+                "   binding is chained; the evidence's arrival is not."]
+    else:
+        d = ev.payload
+        out += [f"3. arrival      : ledger seq {ev.seq}, event {ev.event_id}",
+                f"   attested     : " + ", ".join(f"{k}={d.get(k)}" for k in ATTESTED_FIELDS),
+                f"   declared     : " + ", ".join(f"{k}={d.get(k)}" for k in DECLARED_FIELDS)]
+
+    # 4. the chain
+    if events:
+        from fireweed.ledger import verify_chain
+        good = verify_chain(events)
+        out += [f"4. chain        : {'VERIFIES' if good else 'BROKEN'} — {len(events)} events, "
+                f"genesis to head"]
+    else:
+        out += ["4. chain        : no ledger attached, or no events recorded"]
+
+    out += ["",
+            "WHAT THIS DOES NOT PROVE. The declared fields above are caller-supplied and unverified —",
+            "this shows a caller ASSERTED that provenance, not that the assertion is true. And the",
+            "recorded time is the ingest clock, held by the same party that holds the data, so the",
+            "chain proves ORDER relative to itself and never position in real time. Binding that to",
+            "a real 'at write time' needs an anchor the operator cannot rewrite (a transparency log",
+            "or an RFC 3161 timestamp), which this store does not have."]
+    return "\n".join(out)
 
 
 def tool_recall(args: dict) -> str:
@@ -712,6 +901,11 @@ def tool_stats(args: dict) -> str:
     ])
 
 
+# Module-level: the tool SCHEMA advertises the closed origin-kind list, so a caller sees the
+# vocabulary in the tool definition rather than discovering it from a rejection. Safe here —
+# sys.path is extended at the top of this file, long before this point.
+from fireweed.source_provenance import ORIGIN_KINDS   # noqa: E402
+
 TOOLS = [
     {"name": "remember", "description":
         "Commit a fact to memory. The claim is admitted ONLY if the evidence you cite supports it — "
@@ -728,8 +922,25 @@ TOOLS = [
     {"name": "add_source", "description":
         "Register a source document so claims remembered against it bind to verifiable byte ranges.",
      "inputSchema": {"type": "object", "required": ["source_id", "text"], "properties": {
-         "source_id": {"type": "string"}, "text": {"type": "string"}}},
+         "source_id": {"type": "string"}, "text": {"type": "string"},
+         "origin": {"type": "string", "description":
+             "where these bytes came from (path, URL, endpoint). RECORDED BUT NOT VERIFIED."},
+         "origin_kind": {"type": "string", "enum": list(ORIGIN_KINDS), "description":
+             "the kind of origin. Recorded but not verified."},
+         "supplied_by": {"type": "string", "description":
+             "who handed these bytes over. Recorded but not verified."},
+         "validated_by": {"type": "string", "description":
+             "what checked these bytes before ingest, if anything. Recorded but not verified."}}},
      "fn": tool_add_source},
+    {"name": "trace_evidence", "description":
+        "Audit BACKWARDS from a stored memory to the arrival of the evidence it rests on: the byte "
+        "range it binds, whether those bytes still match, whether the document's arrival is in the "
+        "append-only ledger, and whether the chain verifies. States plainly which fields are "
+        "attested and which are caller-declared.",
+     "inputSchema": {"type": "object", "required": ["claim"], "properties": {
+         "claim": {"type": "string", "description":
+             "any distinctive substring of the stored claim to trace"}}},
+     "fn": tool_trace_evidence},
     {"name": "recall", "description":
         "Search memory. Returns grounded claims with the byte ranges they came from. If the "
         "substrate cannot answer, it ABSTAINS and says which term it could not ground — treat that "
@@ -755,6 +966,14 @@ TOOLS = [
      "fn": tool_export},
     {"name": "memory_stats", "description": "Substrate size, entities, sources held, and mode.",
      "inputSchema": {"type": "object", "properties": {}}, "fn": tool_stats},
+    {"name": "review_quarantine",
+     "description": "List claims the firewall held for review rather than storing. These were NOT "
+                    "written to memory; a QUARANTINE verdict means the claim could not be "
+                    "classified confidently, not that it was rejected.",
+     "inputSchema": {"type": "object",
+                     "properties": {"limit": {"type": "integer",
+                                              "description": "most recent N (default 20)"}}},
+     "fn": tool_review_quarantine},
 ]
 
 

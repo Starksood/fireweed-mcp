@@ -343,3 +343,35 @@ def test_entity_ids_do_not_embed_the_subjects_name(mcp, tmp_path):
     raw = (tmp_path / "store" / "substrate.json").read_text().lower()
     assert "ent_priya" not in raw, "the entity id must not be derived from the name"
     assert (tmp_path / "keys" / "id_salt").exists(), "the salt belongs with the keys, not the store"
+
+
+def test_quarantine_is_actually_logged_for_review(mcp, tmp_path):
+    """The firewall documents QUARANTINE as "too unclear -> log for review".
+
+    It took the same branch as REJECT: no node, no log, no review surface, and the caller told only
+    in the response text. A documented queue that does not exist is worse than an undocumented drop,
+    because an operator reasonably assumes someone can go and look. Flagged twice in external audit.
+    """
+    unclear = "the thing seems somewhat unclear lately"
+    out = mcp.tool("remember", {"claim": unclear, "evidence": unclear, "source_id": "memo",
+                                "source_text": unclear})
+    assert out.startswith("QUARANTINED"), out.splitlines()[0]
+    assert "review" in out.lower()
+
+    queue = mcp.tool("review_quarantine", {})
+    assert unclear in queue, "a quarantined claim must be visible in the review queue"
+    assert "NOT stored" in queue, "the queue must say these were not admitted"
+    assert (tmp_path / "store" / "quarantine.jsonl").exists()
+
+
+def test_quarantine_is_distinct_from_rejection(mcp):
+    """QUARANTINE is 'could not classify', REJECT is 'classified and refused'. Different verdicts."""
+    rejected = mcp.tool("remember", {"claim": "hi there", "evidence": "hi there",
+                                     "source_id": "memo", "source_text": "hi there"})
+    assert rejected.startswith("NOT STORED"), rejected.splitlines()[0]
+    assert "hi there" not in mcp.tool("review_quarantine", {}), \
+        "a rejected claim must not appear in the review queue"
+
+
+def test_empty_quarantine_queue_says_so(mcp):
+    assert "no quarantined claims" in mcp.tool("review_quarantine", {})

@@ -2,7 +2,7 @@
 from __future__ import annotations
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone, timedelta
 from typing import Union
 
@@ -212,6 +212,33 @@ def _extract_predicate(text: str) -> Predicate:
             obj = lw[j]
             break
     return Predicate(lemma=lemma, polarity=polarity, object=obj)
+
+
+def _type_predicate(pred: Predicate, claim) -> Predicate:
+    """Attach the authored slot to an ALREADY-ADMITTED claim, or leave it untyped.
+
+    One-directional by construction: grounding has already decided by the time this runs, so the
+    gate can only add a label. Every failure path — no proposal, an invented slot, a span that is
+    not inside the evidence — returns the predicate unchanged, which means the claim is stored and
+    retrievable exactly as it is today. A bad extraction costs a missed read, never an ungrounded
+    fact. See `predicate_extraction` for the argument in full.
+    """
+    from .predicate_extraction import extract
+
+    evidence = getattr(claim, "evidence_span", None) or ""
+    if not evidence:
+        return pred
+    try:
+        result = extract(claim.claim, evidence)
+    except Exception:
+        # Labelling is never allowed to break admission. An unlabelled claim is the status quo;
+        # a failed ingest is a regression.
+        return pred
+    tp = result.predicate
+    if tp is None:
+        return pred
+    return replace(pred, slot=tp.slot, slot_span=tp.span, slot_start=tp.start, slot_end=tp.end,
+                   slot_vocabulary=tp.vocabulary_version, slot_proposer=tp.proposer)
 
 
 # Auxiliaries help another verb; the claim's predicate is the one they help.
@@ -522,7 +549,7 @@ def _build_node(claim: Claim, resolved_domains: set[str], firewall_decision: str
         node_id=node_id, node_type=_classify_node_type(claim.claim),
         claim=claim.claim, normalized_claim=normalized,
         entities=resolved_entities, domains=resolved_domains, facets=extract_facets(claim.claim),
-        predicate=_extract_predicate(claim.claim),
+        predicate=_type_predicate(_extract_predicate(claim.claim), claim),
         temporal=Temporal(asserted_at=now, stored_at=now, event_time=event_time,
                           valid_from=valid_from, valid_to=None, superseded_by=None),
         provenance=Provenance(source_turn_id=claim.source_turn_id,
