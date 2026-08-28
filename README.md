@@ -53,6 +53,7 @@ No dependencies. No API keys. No model — nothing in this server calls an LLM.
 | `recall` | grounded claims **with the byte range they came from**; abstains and names the term it could not ground |
 | `verify_receipts` | re-hash every source, re-slice every range — **tamper-evident** |
 | `trace_evidence` | audit one memory **backwards** to its evidence's arrival: the bytes it binds, whether they still match, the ledger event that recorded the document, and whether the chain verifies |
+| `review_reads` | what has been asked of this substrate and what it answered — **off by default**, and queries are salted fingerprints unless you also opt into recording text |
 | `forget` | erasure with exact closure and a **signed certificate**; bystanders survive |
 | `export_memory` | the whole substrate as a portable open-format blob |
 
@@ -75,8 +76,14 @@ Stated up front, because this project's last headline number turned out to be me
 (see [the retraction](https://github.com/Starksood/Fireweed_Fabric/blob/main/RETRACTION.md), which
 ships with a script that proves it):
 
-- **It does not extract memories from free text.** You supply the claim and the evidence.
-  Automatic extraction needs a perceiver model; this server deliberately has none.
+- **The server itself does not extract memories from free text.** You supply the claim and the
+  evidence, and nothing in this server calls a model. Since 0.5.0 an optional companion,
+  `fireweed_extractor`, will propose claim/evidence pairs from a transcript using a model you
+  run — and it is **never trusted**: every proposal goes through the same four checks a
+  hand-written one does. Measured across four model families, admitted yield ranged from 0% to
+  99.3% while every unfaithful proposal was rejected with a typed reason. One 4B model produced
+  46 pairs its own cited span did not support; all 46 were refused. The failure mode is *fewer*
+  memories, never false ones.
 - **It does not make an LLM truthful.** It governs what enters the *record* and what can be proven
   about it. Your model can still say whatever it likes in its own prose.
 - **Recall is the weak half, and the honest number is far worse than this page used to claim.**

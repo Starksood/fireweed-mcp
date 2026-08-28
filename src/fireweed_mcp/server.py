@@ -41,6 +41,17 @@ from pathlib import Path
 # Installed as a package: `fireweed` is a sibling module, no path surgery needed.
 ROOT = Path(__file__).resolve().parent
 
+# Read auditing is OFF unless an operator asks for it, and even then the query TEXT stays out of
+# the log unless separately requested. Writes are already recorded immutably; reads are a different
+# privacy question, because a server whose pitch is "trust neither the agent nor the server" should
+# not quietly begin recording every question asked of it.
+def _read_audit_from_env() -> None:
+    from fireweed import read_audit
+    read_audit.ENABLED = os.environ.get("FIREWEED_MCP_READ_AUDIT", "") not in ("", "0", "false")
+    read_audit.RECORD_QUERY_TEXT = (
+        os.environ.get("FIREWEED_MCP_READ_AUDIT_TEXT", "") not in ("", "0", "false"))
+
+
 PROTOCOL_VERSION = "2024-11-05"
 
 
@@ -151,6 +162,7 @@ SUBSTRATE = STORE / "substrate.json"
 SOURCES = STORE / "sources"
 LEDGER_DB = STORE / "ledger.db"
 QUARANTINE_LOG = STORE / "quarantine.jsonl"
+READ_AUDIT_LOG = STORE / "read_audit.jsonl"
 
 # KEYS LIVE APART FROM THE DATA THEY PROTECT.
 #
@@ -509,6 +521,18 @@ def tool_add_source(args: dict) -> str:
             + rec.disclosure())
 
 
+def tool_review_reads(args: dict) -> str:
+    """What has been asked of this substrate, and what it answered.
+
+    Off by default. A documented audit surface that does not exist is worse than no audit surface,
+    because an operator reasonably assumes someone can go and look -- the same reasoning that added
+    a review queue for QUARANTINE verdicts after an external audit flagged it twice.
+    """
+    from fireweed import read_audit
+    _read_audit_from_env()
+    return read_audit.summarise(READ_AUDIT_LOG, limit=int(args.get("limit") or 20))
+
+
 def tool_trace_evidence(args: dict) -> str:
     """Audit BACKWARDS from a stored memory to the arrival of the evidence it rests on.
 
@@ -625,6 +649,20 @@ def tool_recall(args: dict) -> str:
         return "REFUSED — `query` is required."
     fw = fabric()
     r = query_graph(q, fw._ctx.graph)
+
+    # Audit the read. Never allowed to change the outcome: the query has already been decided, and
+    # a failed audit write is the lesser harm compared to turning a successful read into an error.
+    try:
+        from fireweed import read_audit
+        _read_audit_from_env()
+        if read_audit.ENABLED:
+            gv = r.gate_verdict
+            subj = (gv.demand and getattr(gv, "unresolved_subjects", None)) if gv else None
+            read_audit.record(READ_AUDIT_LOG, read_audit.build_event(
+                q, gv or r, salt=id_salt(),
+                subject=(subj[0] if subj else None)))
+    except Exception:
+        pass
     if r.abstain:
         g = r.gate_verdict
         detail = g.detail if g else "no grounded evidence"
@@ -932,6 +970,13 @@ TOOLS = [
          "validated_by": {"type": "string", "description":
              "what checked these bytes before ingest, if anything. Recorded but not verified."}}},
      "fn": tool_add_source},
+    {"name": "review_reads", "description":
+        "What has been asked of this substrate and what it answered. Off unless "
+        "FIREWEED_MCP_READ_AUDIT=1; query text is recorded only if FIREWEED_MCP_READ_AUDIT_TEXT=1 "
+        "as well, otherwise queries appear as salted fingerprints.",
+     "inputSchema": {"type": "object", "properties": {
+         "limit": {"type": "integer", "description": "how many recent reads to show"}}},
+     "fn": tool_review_reads},
     {"name": "trace_evidence", "description":
         "Audit BACKWARDS from a stored memory to the arrival of the evidence it rests on: the byte "
         "range it binds, whether those bytes still match, whether the document's arrival is in the "

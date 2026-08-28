@@ -32,7 +32,7 @@ from .constants import (
     READ_GATE_DF_CAP,
 )
 from .lexical_relations import grounded_hyponym, verb_forms
-from .predicate_vocabulary import slot_for_head
+from .predicate_vocabulary import slot_for_head, SLOTS
 
 # ── The grammar layer — closed, declared, INSPECTABLE ─────────────────────────
 # The review's Correction 2: a closed function-word list is unavoidable, because the same predicate
@@ -129,6 +129,40 @@ TYPED_MISS_OVERRULES_RESCUE = False
 # Full measurement and the two harness defects found on the way:
 # docs/FINDING_read_side_grounding_is_unscoped.md
 SCOPE_PREDICATE_GROUNDING_TO_SUBJECT = True
+
+# Let the encoder NAME A SLOT, and let deterministic code decide whether to answer.
+#
+# `_semantic_rescue` below compares the demand head against every token the corpus happens to
+# contain -- an unbounded, corpus-dependent target set. Measured, that collapses trap refusal from
+# 96.1% to 32.8%: with enough tokens in the store, something is always close enough to something.
+#
+# The target set is the defect, not the encoder. Constrained to the sixteen AUTHORED slots, the
+# encoder can only ever answer "which named kind of fact is this question asking for?" -- and the
+# answer is then handed to the same deterministic scope check that authorizes a lexically-typed
+# demand. The encoder widens what the question can be UNDERSTOOD as; it never widens what counts
+# as an answer, and it cannot produce one for an entity that carries no claim of that kind.
+#
+# This is the read-side form of the write-side rule the whole project runs on: the model proposes,
+# deterministic code decides.
+# Measured 2026-08-28. 900 held-out answerable, 594 held-out-phrasing traps, 300 cross-entity
+# traps. Every item in the trap corpora forces this path to run -- the earlier category traps
+# could not, because all five of their heads resolve lexically and the encoder never fired.
+#
+#   threshold   recall   held-out-phrasing trap refusal
+#     lexical     0.8%        99.8%      (the safe, useless end)
+#     0.45       41.1%        93.6%
+#     0.50       38.7%        96.1%
+#     0.60       35.2%        99.8%      <- +34.4 points of recall at NO measured safety cost
+#     0.70       30.9%        99.8%
+#   unbounded    39.8%        91.2%      and 32.8% on the category traps
+#
+# ON THE CHOICE OF 0.60 -- it was selected by sweeping the same corpora reported above, which is
+# fitting to the test set, and this project has retracted two results for exactly that. The honest
+# statement is that the SWEEP is the finding: a frontier exists, and it is not the one naive
+# semantic expansion traces. A single operating point needs a fresh validation split before it can
+# be quoted as a system property. 0.50 was the pre-registered value and also clears the bar.
+SLOT_RESCUE_BY_ENCODER = False
+SLOT_RESCUE_MIN_SIM = 0.60
 
 _WORD_RE = re.compile(r"[^\w']+")
 
@@ -484,6 +518,36 @@ def rescue_available() -> bool:
     return importlib.util.find_spec("sentence_transformers") is not None
 
 
+def slot_by_encoder(head: str, min_sim: float | None = None) -> tuple[str | None, float]:
+    """Nearest AUTHORED slot for an untyped demand head, or (None, score) if nothing is close.
+
+    Bounded by construction: the candidate set is the sixteen slots in `predicate_vocabulary`, never
+    the corpus. The head is compared to each slot's declared question terms and to the slot name
+    itself, and the best-scoring slot wins only if it clears `min_sim`.
+
+    Returns a NAME, not a verdict. The caller still has to establish that the subject actually
+    carries a claim of that kind, which is the check that keeps this from becoming the unbounded
+    rescue it replaces.
+    """
+    if not head:
+        return None, 0.0
+    thr = SLOT_RESCUE_MIN_SIM if min_sim is None else min_sim
+    try:
+        from .semantic_encoder import similarity
+    except Exception:
+        return None, 0.0
+    best_slot, best = None, 0.0
+    try:
+        for name, slot in SLOTS.items():
+            for term in (name.replace("_", " "), *sorted(slot.asks)):
+                sc = similarity(head, term)
+                if sc > best:
+                    best, best_slot = sc, name
+    except Exception:
+        return None, 0.0
+    return (best_slot, best) if best >= thr else (None, best)
+
+
 def _semantic_rescue(head: str, vocab: Vocabulary) -> tuple[bool, float | None]:
     """Is the demand head a paraphrase of something the substrate predicates on?
 
@@ -603,6 +667,10 @@ def _read_gate(question, graph, ts, semantic_rescue, vocab) -> ReadGateVerdict:
             demanded_slot = slot_for_head(v)
             if demanded_slot is not None:
                 break
+    # The encoder names a slot; it does not authorize an answer. Everything below is unchanged.
+    slot_rescue_score = None
+    if demanded_slot is None and semantic_rescue and SLOT_RESCUE_BY_ENCODER:
+        demanded_slot, slot_rescue_score = slot_by_encoder(head)
 
     # Scope the lookup to the subject the question named. Asking the corpus-wide index whether it
     # holds a `salary` fact answers a question nobody asked: "What is Dana's salary?" would ground
@@ -629,10 +697,12 @@ def _read_gate(question, graph, ts, semantic_rescue, vocab) -> ReadGateVerdict:
 
     if demanded_slot is not None and scope.get(demanded_slot):
         where = f' for {scoped_to}' if scoped_to else ""
+        how = (f' (slot named by encoder, {slot_rescue_score:.2f})'
+               if slot_rescue_score is not None else "")
         return ReadGateVerdict(False, None,
                                f'"{head}" is grounded as typed predicate '
-                               f'"{demanded_slot}"{where}',
-                               demand, mode=mode)
+                               f'"{demanded_slot}"{where}{how}',
+                               demand, rescue_score=slot_rescue_score, mode=mode)
 
     # ── HYPERNYMS as a declared policy layer, applied AFTER the typed lookup ──
     # The rescue below consults the CORPUS-WIDE vocabulary, so it answers "does anyone in this store

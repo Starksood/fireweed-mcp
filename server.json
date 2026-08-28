@@ -3,7 +3,7 @@
   "name": "io.github.Starksood/fireweed-mcp",
   "title": "Fireweed",
   "description": "Agent memory where every fact carries a receipt, and deletion is provable.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "repository": {
     "url": "https://github.com/Starksood/fireweed-mcp",
     "source": "github"
@@ -12,7 +12,7 @@
     {
       "registryType": "pypi",
       "identifier": "fireweed-mcp",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "transport": {
         "type": "stdio"
       }
